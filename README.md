@@ -25,6 +25,8 @@ Camoufox (anti-detect Firefox fork)
 
 - `plugins/browser/foxbridge/` — Hermes plugin (`kind: backend`, `provides_browser_providers: [foxbridge]`). Select with `browser.cloud_provider: foxbridge`.
 - `docker/Dockerfile` — `foxbridge-camoufox` image: foxbridge + Camoufox bundle (built on the camofox-browser image), published to `ghcr.io/lgwacker/foxbridge-camoufox` by CI.
+- `docker/bootstrap.mjs` — dynamic bootstrap: calls the same `camoufox-js launchOptions()` the camofox server uses, writes `CAMOU_CONFIG_1..N` / `FONTCONFIG_PATH` / `DISPLAY` to the sidecar env, `firefoxUserPrefs` to the profile, and bakes the uBO addon into the fingerprint config. Fresh random seeds per boot = no fixed identity.
+- `patches/` — the **two mandatory foxbridge patches** (see [`patches/README.md`](patches/README.md)): `foxbridge-fetch-noop.patch` (Juggler deadlock fix) and `foxbridge-mainframe-context.patch` (ad-iframe drift fix). Both are baked into the committed binary and the published image.
 - Provider lifecycle mirrors the camofox integration: the sidecar **starts on first use** and **stops after `FOXBRIDGE_IDLE_TIMEOUT_S`** (default 900 s) of inactivity.
 
 ## Install
@@ -49,6 +51,9 @@ browser tools work without it).
 > takes precedence over any `browser.cloud_provider` (Hermes design). Remove it
 > to let this provider serve browser traffic.
 
+> ⚠️ Start a **new session** after installing (the provider selection is
+> read once per process and cached).
+
 ## Configuration (env vars)
 
 | Var | Default | Purpose |
@@ -68,6 +73,14 @@ browser tools work without it).
   sleeps, or use `ensure_real_tab()` + `goto_url(url)` instead of
   `new_tab()` (verified landing cleanly through this stack).
 - `CAMOFOX_URL` must not be set (see Install).
+- **Sessionstore resurrection** — Camoufox restores old tabs (Google
+  Sign-In, ad pages) from the profile's sessionstore on sidecar restart;
+  the harness can then attach to an ad iframe instead of the main page.
+  Delete `recovery*.lz4` / `sessionstore*` in `~/.hermes/foxbridge-profiles/`
+  before restarting the sidecar manually.
+- **Stale browser-use daemon** — after a manual sidecar restart, kill the
+  harness daemon (`pkill -f "browser_harness[.]daemon"`); the provider does
+  this automatically in `create_session`.
 
 ## Development
 
@@ -76,7 +89,14 @@ python -m pytest tests/ -q          # unit tests (no Docker, no Hermes needed)
 ./scripts/build-image.sh            # build the sidecar image locally
 ```
 
-CI: unit tests on every push; image build+push to GHCR on `main`.
+`build-image.sh` rebuilds the foxbridge binary from upstream `7dee166` and
+applies **both** patches in order (noop first, mainframe second) — see
+[`patches/README.md`](patches/README.md) for why the order matters and how
+to bump the upstream ref.
+
+CI: unit tests on every push; image build+push to GHCR on `main` (uses the
+**committed** `docker/foxbridge` binary — deliberately NOT `go install
+@latest`, which would silently drop the patches).
 
 ## Roadmap
 
