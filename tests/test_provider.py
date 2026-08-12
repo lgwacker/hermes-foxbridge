@@ -122,8 +122,8 @@ class IdleLifecycleTest(unittest.TestCase):
 class EnsureRunningTest(unittest.TestCase):
     @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
     @mock.patch("provider._run", return_value=(0, ""))
-    def test_absent_creates_with_network_host(self, run, healthy):
-        p = FoxbridgeBrowserProvider()
+    def test_absent_creates_with_network_host_and_profile(self, run, healthy):
+        p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-test-profile")
         with mock.patch.object(p, "_container_state", return_value="absent"):
             p._ensure_running()
         cmds = [c[0][0] for c in run.call_args_list]
@@ -131,6 +131,8 @@ class EnsureRunningTest(unittest.TestCase):
         self.assertIn("run", cmds[0])
         self.assertIn("--network", cmds[0])
         self.assertIn("host", cmds[0])
+        self.assertIn("-v", cmds[0])
+        self.assertIn("/profile", " ".join(cmds[0]))
         self.assertIn(p._image, cmds[0])
         # stale daemon cleanup runs after the container is up
         self.assertEqual(cmds[-1][:2], ["pkill", "-f"])
@@ -138,9 +140,10 @@ class EnsureRunningTest(unittest.TestCase):
 
     @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
     @mock.patch("provider._run", return_value=(0, ""))
-    def test_exited_starts(self, run, healthy):
+    def test_exited_with_mount_starts(self, run, healthy):
         p = FoxbridgeBrowserProvider()
-        with mock.patch.object(p, "_container_state", return_value="exited"):
+        with mock.patch.object(p, "_container_state", return_value="exited"), \
+             mock.patch.object(p, "_container_has_profile_mount", return_value=True):
             p._ensure_running()
         cmds = [c[0][0] for c in run.call_args_list]
         self.assertEqual(cmds[0][:2], ["docker", "start"])
@@ -149,12 +152,29 @@ class EnsureRunningTest(unittest.TestCase):
 
     @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
     @mock.patch("provider._run", return_value=(0, ""))
-    def test_running_restarts_to_clear_leftover_tabs(self, run, healthy):
+    def test_exited_without_mount_recreates(self, run, healthy):
+        """A container created by the old image (no -v /profile) must be
+        recreated so the persistent profile volume is attached."""
+        p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-test-profile")
+        with mock.patch.object(p, "_container_state", return_value="exited"), \
+             mock.patch.object(p, "_container_has_profile_mount", return_value=False):
+            p._ensure_running()
+        cmds = [c[0][0] for c in run.call_args_list]
+        self.assertEqual(cmds[0][:3], ["docker", "rm", "-f"])
+        self.assertIn("run", cmds[1])
+        self.assertIn("-v", cmds[1])
+        self.assertIn("/tmp/fb-test-profile:/profile", " ".join(cmds[1]))
+        healthy.assert_called_once()
+
+    @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
+    @mock.patch("provider._run", return_value=(0, ""))
+    def test_running_with_mount_restarts(self, run, healthy):
         """A running sidecar carries leftover tabs that break the
         browser-use harness (it attaches to the first existing page) —
         every session must start from a restarted, single-tab browser."""
         p = FoxbridgeBrowserProvider()
-        with mock.patch.object(p, "_container_state", return_value="running"):
+        with mock.patch.object(p, "_container_state", return_value="running"), \
+             mock.patch.object(p, "_container_has_profile_mount", return_value=True):
             p._ensure_running()
         cmds = [c[0][0] for c in run.call_args_list]
         self.assertEqual(cmds[0][:2], ["docker", "restart"])
@@ -164,10 +184,23 @@ class EnsureRunningTest(unittest.TestCase):
         healthy.assert_called_once()
 
     @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
+    @mock.patch("provider._run", return_value=(0, ""))
+    def test_running_without_mount_recreates(self, run, healthy):
+        p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-test-profile")
+        with mock.patch.object(p, "_container_state", return_value="running"), \
+             mock.patch.object(p, "_container_has_profile_mount", return_value=False):
+            p._ensure_running()
+        cmds = [c[0][0] for c in run.call_args_list]
+        self.assertEqual(cmds[0][:3], ["docker", "rm", "-f"])
+        self.assertIn("run", cmds[1])
+        healthy.assert_called_once()
+
+    @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
     @mock.patch("provider._run", return_value=(1, "boom"))
     def test_running_restart_failure_raises(self, run, healthy):
         p = FoxbridgeBrowserProvider()
-        with mock.patch.object(p, "_container_state", return_value="running"):
+        with mock.patch.object(p, "_container_state", return_value="running"), \
+             mock.patch.object(p, "_container_has_profile_mount", return_value=True):
             with self.assertRaises(RuntimeError):
                 p._ensure_running()
         healthy.assert_not_called()

@@ -36,6 +36,10 @@ DEFAULT_IMAGE = os.environ.get(
     "FOXBRIDGE_IMAGE",
     "ghcr.io/lgwacker/foxbridge-camoufox:latest",
 )
+DEFAULT_PROFILE_DIR = os.environ.get(
+    "FOXBRIDGE_PROFILE_DIR",
+    os.path.join(os.path.expanduser("~"), ".hermes", "foxbridge-profiles"),
+)
 DEFAULT_IDLE_TIMEOUT_S = int(os.environ.get("FOXBRIDGE_IDLE_TIMEOUT_S", "900"))
 HEALTH_TIMEOUT_S = 90
 IDLE_POLL_S = 30
@@ -75,11 +79,13 @@ class FoxbridgeBrowserProvider(BrowserProvider):
         cdp_url: Optional[str] = None,
         container: Optional[str] = None,
         image: Optional[str] = None,
+        profile_dir: Optional[str] = None,
         idle_timeout_s: Optional[int] = None,
     ) -> None:
         self._cdp_url = cdp_url or DEFAULT_CDP_URL
         self._container = container or DEFAULT_CONTAINER
         self._image = image or DEFAULT_IMAGE
+        self._profile_dir = profile_dir or DEFAULT_PROFILE_DIR
         self._idle_timeout_s = idle_timeout_s or DEFAULT_IDLE_TIMEOUT_S
         self._last_used = 0.0
         self._lock = threading.Lock()
@@ -184,6 +190,31 @@ class FoxbridgeBrowserProvider(BrowserProvider):
             return "absent"
         return out.strip() or "absent"
 
+    def _container_has_profile_mount(self) -> bool:
+        """True when the existing container was created with the persistent
+        profile volume (old images ran without -v /profile)."""
+        code, out = _run(
+            [
+                "docker", "inspect", "-f",
+                "{{range .Mounts}}{{.Destination}} {{end}}",
+                self._container,
+            ],
+            timeout=15,
+        )
+        return code == 0 and "/profile" in out
+
+    def _recreate_container(self) -> None:
+        """Drop a stale container (wrong image/entrypoint/mounts) and let the
+        create path rebuild it. Best-effort — never raises."""
+        code, out = _run(
+            ["docker", "rm", "-f", self._container], timeout=60
+        )
+        if code != 0:
+            logger.warning(
+                "foxbridge stale container removal failed (rc=%s): %s",
+                code, out[:120],
+            )
+
     def _ensure_running(self) -> None:
         state = self._container_state()
         if state == "running":
@@ -194,12 +225,20 @@ class FoxbridgeBrowserProvider(BrowserProvider):
             # example.com, ...) make every new navigation land in the
             # wrong tab. Restart the sidecar so each session starts with
             # a clean single-tab browser (~2-3s).
-            code, out = _run(["docker", "restart", self._container], timeout=120)
-            if code != 0:
-                raise RuntimeError(
-                    f"foxbridge sidecar could not be restarted: {out[:300]}"
+            if not self._container_has_profile_mount():
+                self._recreate_container()
+                state = "absent"
+            else:
+                code, out = _run(
+                    ["docker", "restart", self._container], timeout=120
                 )
-        elif state == "absent":
+                if code != 0:
+                    raise RuntimeError(
+                        f"foxbridge sidecar could not be restarted: {out[:300]}"
+                    )
+        if state == "absent":
+            if not os.path.isdir(self._profile_dir):
+                os.makedirs(self._profile_dir, exist_ok=True)
             code, out = _run(
                 [
                     "docker", "run", "-d",
@@ -208,6 +247,9 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                     # foxbridge binds 127.0.0.1 only (no --host flag yet),
                     # so the sidecar shares the host network namespace.
                     "--network", "host",
+                    # persistent Camoufox profile: cookies/ad-sync state and
+                    # uBO filter lists survive restarts (see README).
+                    "-v", f"{self._profile_dir}:/profile",
                     self._image,
                 ],
                 timeout=180,
@@ -217,12 +259,36 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                     f"foxbridge sidecar could not be created "
                     f"(image: {self._image}): {out[:300]}"
                 )
-        else:
-            code, out = _run(["docker", "start", self._container], timeout=60)
-            if code != 0:
-                raise RuntimeError(
-                    f"foxbridge sidecar could not be started: {out[:300]}"
+        elif state == "exited":
+            if not self._container_has_profile_mount():
+                self._recreate_container()
+                state = "absent"
+                if not os.path.isdir(self._profile_dir):
+                    os.makedirs(self._profile_dir, exist_ok=True)
+                code, out = _run(
+                    [
+                        "docker", "run", "-d",
+                        "--name", self._container,
+                        "--restart", "unless-stopped",
+                        "--network", "host",
+                        "-v", f"{self._profile_dir}:/profile",
+                        self._image,
+                    ],
+                    timeout=180,
                 )
+                if code != 0:
+                    raise RuntimeError(
+                        f"foxbridge sidecar could not be created "
+                        f"(image: {self._image}): {out[:300]}"
+                    )
+            else:
+                code, out = _run(
+                    ["docker", "start", self._container], timeout=60
+                )
+                if code != 0:
+                    raise RuntimeError(
+                        f"foxbridge sidecar could not be started: {out[:300]}"
+                    )
         # The browser-use CLI keeps a persistent daemon
         # (browser_harness.daemon) that holds the CDP WebSocket across
         # calls. After a sidecar restart the daemon's sessions point at
