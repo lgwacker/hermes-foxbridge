@@ -1,0 +1,7 @@
+name: browser-foxbridge
+version: 0.1.0
+description: "Foxbridge CDP backend: browser-use harness and built-in browser tools drive a Camoufox anti-detect browser via the foxbridge CDP-to-Juggler proxy (Docker sidecar, idle-stop)."
+author: lgwacker
+kind: backend
+provides_browser_providers:
+  - foxbridge

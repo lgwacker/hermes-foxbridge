@@ -1,0 +1,33 @@
+name: docker-image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - ".github/workflows/docker-image.yml"
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build foxbridge binary (throwaway golang container)
+        run: |
+          mkdir -p dist
+          docker run --rm -v "$PWD/dist:/out" golang:1.26 \
+            sh -c "go install github.com/VulpineOS/foxbridge/cmd/foxbridge@latest && cp /go/bin/foxbridge /out/foxbridge"
+          cp dist/foxbridge docker/foxbridge
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push image
+        run: |
+          docker build -t ghcr.io/lgwacker/foxbridge-camoufox:latest docker/
+          docker push ghcr.io/lgwacker/foxbridge-camoufox:latest
