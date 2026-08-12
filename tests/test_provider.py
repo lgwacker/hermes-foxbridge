@@ -51,6 +51,7 @@ PROVIDER_DIR = Path(__file__).resolve().parents[1] / "plugins" / "browser" / "fo
 sys.path.insert(0, str(PROVIDER_DIR))
 
 from provider import FoxbridgeBrowserProvider  # noqa: E402
+import provider  # noqa: E402 — module ref for constants (BOOT_STABILIZE_S)
 
 
 class ProviderContractTest(unittest.TestCase):
@@ -125,12 +126,14 @@ class EnsureRunningTest(unittest.TestCase):
         p = FoxbridgeBrowserProvider()
         with mock.patch.object(p, "_container_state", return_value="absent"):
             p._ensure_running()
-        cmd = run.call_args[0][0]
-        self.assertEqual(cmd[0], "docker")
-        self.assertIn("run", cmd)
-        self.assertIn("--network", cmd)
-        self.assertIn("host", cmd)
-        self.assertIn(p._image, cmd)
+        cmds = [c[0][0] for c in run.call_args_list]
+        self.assertEqual(cmds[0][0], "docker")
+        self.assertIn("run", cmds[0])
+        self.assertIn("--network", cmds[0])
+        self.assertIn("host", cmds[0])
+        self.assertIn(p._image, cmds[0])
+        # stale daemon cleanup runs after the container is up
+        self.assertEqual(cmds[-1][:2], ["pkill", "-f"])
         healthy.assert_called_once()
 
     @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
@@ -139,9 +142,35 @@ class EnsureRunningTest(unittest.TestCase):
         p = FoxbridgeBrowserProvider()
         with mock.patch.object(p, "_container_state", return_value="exited"):
             p._ensure_running()
-        cmd = run.call_args[0][0]
-        self.assertEqual(cmd[:2], ["docker", "start"])
+        cmds = [c[0][0] for c in run.call_args_list]
+        self.assertEqual(cmds[0][:2], ["docker", "start"])
+        self.assertEqual(cmds[-1][:2], ["pkill", "-f"])
         healthy.assert_called_once()
+
+    @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
+    @mock.patch("provider._run", return_value=(0, ""))
+    def test_running_restarts_to_clear_leftover_tabs(self, run, healthy):
+        """A running sidecar carries leftover tabs that break the
+        browser-use harness (it attaches to the first existing page) —
+        every session must start from a restarted, single-tab browser."""
+        p = FoxbridgeBrowserProvider()
+        with mock.patch.object(p, "_container_state", return_value="running"):
+            p._ensure_running()
+        cmds = [c[0][0] for c in run.call_args_list]
+        self.assertEqual(cmds[0][:2], ["docker", "restart"])
+        self.assertEqual(cmds[0][2], p._container)
+        # the stale CLI daemon is killed before the health check
+        self.assertEqual(cmds[-1][:2], ["pkill", "-f"])
+        healthy.assert_called_once()
+
+    @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
+    @mock.patch("provider._run", return_value=(1, "boom"))
+    def test_running_restart_failure_raises(self, run, healthy):
+        p = FoxbridgeBrowserProvider()
+        with mock.patch.object(p, "_container_state", return_value="running"):
+            with self.assertRaises(RuntimeError):
+                p._ensure_running()
+        healthy.assert_not_called()
 
     @mock.patch("provider._run", return_value=(1, "docker: image pull failed"))
     def test_create_failure_raises_clear_error(self, run):
@@ -150,12 +179,15 @@ class EnsureRunningTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "could not be created"):
                 p._ensure_running()
 
+    @mock.patch("provider.time.sleep")
     @mock.patch("provider.urllib.request.urlopen")
-    def test_wait_healthy_success(self, urlopen):
+    def test_wait_healthy_success(self, urlopen, sleep):
         resp = mock.MagicMock()
         resp.status = 200
         urlopen.return_value.__enter__.return_value = resp
         FoxbridgeBrowserProvider()._wait_healthy()  # must not raise
+        # boot stabilization sleep runs before declaring healthy
+        sleep.assert_called_once_with(provider.BOOT_STABILIZE_S)
 
     @mock.patch("provider.time.sleep")
     @mock.patch(

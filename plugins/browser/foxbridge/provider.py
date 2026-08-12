@@ -39,6 +39,13 @@ DEFAULT_IMAGE = os.environ.get(
 DEFAULT_IDLE_TIMEOUT_S = int(os.environ.get("FOXBRIDGE_IDLE_TIMEOUT_S", "900"))
 HEALTH_TIMEOUT_S = 90
 IDLE_POLL_S = 30
+# The foxbridge CDP endpoint answers as soon as the proxy is up, but the
+# Camoufox browser process needs a few more seconds before its main frame
+# accepts navigations. Navigating too early makes every subsequent
+# Page.navigate abort with NS_BINDING_ABORTED until the sidecar restarts
+# (validated 2026-08-12: navigating 2s after boot corrupted the frame;
+# restart + 10s settle navigated fine).
+BOOT_STABILIZE_S = float(os.environ.get("FOXBRIDGE_BOOT_STABILIZE_S", "10"))
 
 
 def _run(cmd, timeout: int = 30):
@@ -180,8 +187,19 @@ class FoxbridgeBrowserProvider(BrowserProvider):
     def _ensure_running(self) -> None:
         state = self._container_state()
         if state == "running":
-            return
-        if state == "absent":
+            # The foxbridge browser persists across CDP sessions: tabs
+            # from previous sessions stay open. The browser-use CLI
+            # harness (v0.1.8) attaches to the FIRST existing page target
+            # and keeps evaluating there, so leftover tabs (about:blank,
+            # example.com, ...) make every new navigation land in the
+            # wrong tab. Restart the sidecar so each session starts with
+            # a clean single-tab browser (~2-3s).
+            code, out = _run(["docker", "restart", self._container], timeout=120)
+            if code != 0:
+                raise RuntimeError(
+                    f"foxbridge sidecar could not be restarted: {out[:300]}"
+                )
+        elif state == "absent":
             code, out = _run(
                 [
                     "docker", "run", "-d",
@@ -205,7 +223,31 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                 raise RuntimeError(
                     f"foxbridge sidecar could not be started: {out[:300]}"
                 )
+        # The browser-use CLI keeps a persistent daemon
+        # (browser_harness.daemon) that holds the CDP WebSocket across
+        # calls. After a sidecar restart the daemon's sessions point at
+        # dead tabs, making navigation hang (Page.navigate accepted but
+        # never committed). Kill it so the next browser_exec starts a
+        # fresh daemon with a clean connection.
+        self._stop_stale_cli_daemon()
         self._wait_healthy()
+
+    def _stop_stale_cli_daemon(self) -> None:
+        """Kill the browser-use CLI daemon (browser_harness.daemon) so the
+        next browser_exec starts with a fresh CDP connection. The daemon
+        persists across CLI calls and holds the CDP WebSocket plus target
+        sessions; after the sidecar restarts those sessions point at dead
+        tabs and navigation hangs (Page.navigate accepted, never
+        committed). rc 0 = killed, 1 = nothing matched — both fine.
+        """
+        code, out = _run(
+            ["pkill", "-f", "python -m browser_harness.daemon"], timeout=10
+        )
+        if code not in (0, 1):
+            logger.warning(
+                "foxbridge stale daemon cleanup failed (rc=%s): %s",
+                code, out[:120],
+            )
 
     def _wait_healthy(self) -> None:
         deadline = time.time() + HEALTH_TIMEOUT_S
@@ -216,7 +258,13 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                     f"{self._cdp_url}/json/version", timeout=3
                 ) as resp:
                     if resp.status == 200:
-                        logger.info("foxbridge sidecar healthy at %s", self._cdp_url)
+                        # CDP is up but the Camoufox process may still be
+                        # settling — give the browser boot a moment before
+                        # declaring the sidecar usable (see BOOT_STABILIZE_S).
+                        time.sleep(BOOT_STABILIZE_S)
+                        logger.info(
+                            "foxbridge sidecar healthy at %s", self._cdp_url
+                        )
                         return
             except Exception as exc:  # health probe must never raise
                 last_err = str(exc)
