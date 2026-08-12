@@ -58,6 +58,17 @@ built-in funcionam sem ele).
 | `FOXBRIDGE_IMAGE` | `ghcr.io/lgwacker/foxbridge-camoufox:latest` | Imagem do sidecar |
 | `FOXBRIDGE_IDLE_TIMEOUT_S` | `900` | Segundos de idle antes de parar o sidecar |
 
+## Armadilhas conhecidas
+
+- **Race do `wait_for_load()` com `about:blank`** — o harness considera a
+  página carregada assim que `document.readyState` é `complete`, o que já é
+  verdade no `about:blank`. Logo após `new_tab(url)`, o `wait_for_load()`
+  pode retornar antes da navegação commitar e o `page_info()` ainda mostra
+  `about:blank`. Workaround: faça polling do `page_info()` algumas vezes com
+  pequenos sleeps, ou use `ensure_real_tab()` + `goto_url(url)` em vez de
+  `new_tab()` (verificado carregando limpo através desta stack).
+- `CAMOFOX_URL` não pode estar setado (veja Instalação).
+
 ## Desenvolvimento
 
 ```bash

@@ -58,6 +58,17 @@ browser tools work without it).
 | `FOXBRIDGE_IMAGE` | `ghcr.io/lgwacker/foxbridge-camoufox:latest` | Sidecar image |
 | `FOXBRIDGE_IDLE_TIMEOUT_S` | `900` | Idle seconds before the sidecar is stopped |
 
+## Known pitfalls
+
+- **`wait_for_load()` race on `about:blank`** — the harness considers a page
+  loaded as soon as `document.readyState` is `complete`, which is already
+  true on `about:blank`. Right after `new_tab(url)`, `wait_for_load()` can
+  therefore return before the navigation commits, and `page_info()` still
+  shows `about:blank`. Workaround: poll `page_info()` a few times with short
+  sleeps, or use `ensure_real_tab()` + `goto_url(url)` instead of
+  `new_tab()` (verified landing cleanly through this stack).
+- `CAMOFOX_URL` must not be set (see Install).
+
 ## Development
 
 ```bash
