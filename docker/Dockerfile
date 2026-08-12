@@ -20,7 +20,7 @@
 # The foxbridge binary must exist in the build context (docker/foxbridge).
 # Build it with scripts/build-image.sh or the CI workflow.
 
-FROM camofox-browser:135.0.1-x86_64
+FROM ghcr.io/lgwacker/camofox-browser-base:135.0.1-x86_64
 
 COPY foxbridge /usr/local/bin/foxbridge
 RUN chmod +x /usr/local/bin/foxbridge
