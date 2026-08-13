@@ -14,32 +14,8 @@ Lifecycle: the sidecar starts on first use and is stopped after
 `FOXBRIDGE_IDLE_TIMEOUT_S` (default 900 s) of inactivity — same lazy
 start / idle-stop pattern as the camofox integration.
 
-> ℹ️ **Idle timeout floor (0.2.0):** the core passes its own
-> `browser.inactivity_timeout` (default 120 s) into every provider as
-> `idle_timeout_s`. The plugin treats its documented value as a **floor** —
-> the effective idle timeout is `max(core_arg, FOXBRIDGE_IDLE_TIMEOUT_S)`,
-> so a short core value can never idle-stop the sidecar out from under an
-> open session (the "dead-sidecar session trap", fixed 2026-08-13). The
-> effective value is logged at provider construction.
-
-**Self-healing (0.2.0):** if the sidecar exits with a non-zero code (a real
-crash — not the clean exit-0 idle-stop) while a session is open, the idle
-watcher restarts it automatically within ~30 s; the core's supervisor
-reconnects as soon as the CDP endpoint answers. If a `docker start`/`restart`
-comes back but fails the health check (e.g. the entrypoint's Xvfb lock after
-`docker stop`), the provider drops and recreates the container once before
-giving up. Health checks also verify the endpoint identity — a foreign
-service on the port (cron-mode Chrome on 9222) is never declared healthy.
-
-> 🔒 **Ownership guard (0.2.1):** several long-lived Hermes processes
-> (desktop backend, gateway, leftover CLI sessions) can each run a provider
-> with its own idle watcher on the SAME container name. The watcher
-> captures the sidecar's `StartedAt` at every session start and only
-> idle-stops while it still matches — a container started/restarted by
-> another instance (or a manual `docker start`) is never stopped by a
-> stale watcher. Symptom this fixes: the sidecar dying with a clean
-> exit-0 `shutting down...` 7-15 s after every boot while a
-> `browser_exec` is in flight ("no close frame received").
+Version history (idle-timeout floor, auto-heal, ownership guard, ...):
+see [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
