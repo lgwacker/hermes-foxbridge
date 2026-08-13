@@ -104,10 +104,25 @@ class FoxbridgeBrowserProvider(BrowserProvider):
         self._container = container or DEFAULT_CONTAINER
         self._image = image or DEFAULT_IMAGE
         self._profile_dir = profile_dir or DEFAULT_PROFILE_DIR
-        self._idle_timeout_s = idle_timeout_s or DEFAULT_IDLE_TIMEOUT_S
+        # The core Hermes passes its own idle timeout (browser.inactivity_timeout,
+        # default 120 s) as `idle_timeout_s` — that arg silently beat the
+        # plugin's documented FOXBRIDGE_IDLE_TIMEOUT_S (default 900 s), so the
+        # watcher idle-stopped the sidecar mid-session while the supervisor
+        # still held it open (dead-sidecar session trap, 2026-08-13). The
+        # plugin default/env is the FLOOR: the core may extend, never shorten.
+        self._idle_timeout_s = max(
+            idle_timeout_s or 0, DEFAULT_IDLE_TIMEOUT_S
+        )
         self._last_used = 0.0
+        self._session_open = False
         self._lock = threading.Lock()
         self._watcher: Optional[threading.Thread] = None
+        logger.info(
+            "foxbridge provider ready: cdp=%s container=%s image=%s "
+            "idle_timeout_s=%s (core_arg=%s, plugin_default=%s)",
+            self._cdp_url, self._container, self._image,
+            self._idle_timeout_s, idle_timeout_s, DEFAULT_IDLE_TIMEOUT_S,
+        )
 
     # ------------------------------------------------------------------
     # BrowserProvider contract
@@ -120,6 +135,8 @@ class FoxbridgeBrowserProvider(BrowserProvider):
 
     def create_session(self, task_id: str) -> Dict[str, object]:
         self._ensure_running()
+        with self._lock:
+            self._session_open = True
         self._touch()
         features: Dict[str, str] = {}
         if self._vnc_enabled():
@@ -133,14 +150,18 @@ class FoxbridgeBrowserProvider(BrowserProvider):
         }
 
     def close_session(self, session_id: str) -> bool:
-        # The sidecar stays up; the idle watcher stops it. Nothing to
-        # release per-session (the CDP endpoint is shared).
+        # The sidecar stays up; the idle watcher stops it. Mark the session
+        # closed so the auto-heal never resurrects the sidecar for a session
+        # the core has already torn down.
+        with self._lock:
+            self._session_open = False
         return True
 
     def emergency_cleanup(self, session_id: str) -> None:
         # Best-effort teardown at process exit. The container is
         # disposable; the idle watcher / restart policy covers it.
-        pass
+        with self._lock:
+            self._session_open = False
 
     def get_setup_schema(self) -> Optional[Dict[str, Any]]:
         return {
@@ -193,18 +214,59 @@ class FoxbridgeBrowserProvider(BrowserProvider):
             self._idle_tick()
 
     def _idle_tick(self) -> None:
-        """One idle-check iteration — split out for testability."""
+        """One idle-check iteration — split out for testability.
+
+        Two jobs:
+        1. Auto-heal: if the sidecar exited with a non-zero code (a real
+           crash, NOT the clean exit-0 idle-stop) while a session is open,
+           restart it. The core's browser_supervisor caches the session and
+           never re-invokes ``create_session`` after the sidecar dies, so
+           without this every later ``browser_exec`` fails with
+           ``connect failed`` until /reset (dead-sidecar session trap,
+           2026-08-13).
+        2. Idle-stop: stop the sidecar after ``_idle_timeout_s`` of no
+           ``create_session`` activity.
+        """
         with self._lock:
             idle_s = time.time() - self._last_used
+            session_open = self._session_open
+        state = self._container_state()
+        if state == "exited" and session_open:
+            exit_code = self._container_exit_code()
+            if exit_code is not None and exit_code != "0":
+                logger.info(
+                    "foxbridge sidecar exited with code %s while session "
+                    "open — auto-healing", exit_code,
+                )
+                try:
+                    # _ensure_running does docker start/restart + daemon
+                    # cleanup + health check; must never kill the watcher.
+                    self._ensure_running()
+                except Exception as exc:  # noqa: BLE001 — watcher must live
+                    logger.warning("foxbridge auto-heal failed: %s", exc)
+                return
         if idle_s < self._idle_timeout_s:
             return
-        if self._container_state() != "running":
+        if state != "running":
             return
         code, out = _run(["docker", "stop", self._container], timeout=60)
         if code == 0:
             logger.info("foxbridge sidecar stopped after %.0fs idle", idle_s)
         else:
             logger.warning("foxbridge idle stop failed: %s", out[:200])
+
+    def _container_exit_code(self) -> Optional[str]:
+        """Exit code of an exited container, or None when not inspectable."""
+        code, out = _run(
+            [
+                "docker", "inspect", "-f", "{{.State.ExitCode}}",
+                self._container,
+            ],
+            timeout=15,
+        )
+        if code != 0:
+            return None
+        return out.strip()
 
     def _container_state(self) -> str:
         """Return 'running', another live status, or 'absent'."""
@@ -317,6 +379,7 @@ class FoxbridgeBrowserProvider(BrowserProvider):
 
     def _ensure_running(self) -> None:
         state = self._container_state()
+        fresh_created = False
         if state == "running":
             # The foxbridge browser persists across CDP sessions: tabs
             # from previous sessions stay open. The browser-use CLI
@@ -337,54 +400,15 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                         f"foxbridge sidecar could not be restarted: {out[:300]}"
                     )
         if state == "absent":
-            if not os.path.isdir(self._profile_dir):
-                os.makedirs(self._profile_dir, exist_ok=True)
-            code, out = _run(
-                [
-                    "docker", "run", "-d",
-                    "--name", self._container,
-                    "--restart", "unless-stopped",
-                    # bridge networking: the --host patch makes foxbridge
-                    # bind 0.0.0.0 inside; -p publishes loopback-only.
-                    # persistent Camoufox profile: cookies/ad-sync state and
-                    # uBO filter lists survive restarts (see README).
-                    "-v", f"{self._profile_dir}:/profile",
-                    *self._vnc_env_args(),
-                    *self._cdp_env_args(),
-                    *self._port_env_args(),
-                    self._image,
-                ],
-                timeout=180,
-            )
-            if code != 0:
-                raise RuntimeError(
-                    f"foxbridge sidecar could not be created "
-                    f"(image: {self._image}): {out[:300]}"
-                )
+            self._ensure_profile_dir()
+            self._create_container()
+            fresh_created = True
         elif state == "exited":
             if self._container_is_stale():
                 self._recreate_container()
-                state = "absent"
-                if not os.path.isdir(self._profile_dir):
-                    os.makedirs(self._profile_dir, exist_ok=True)
-                code, out = _run(
-                    [
-                        "docker", "run", "-d",
-                        "--name", self._container,
-                        "--restart", "unless-stopped",
-                        "-v", f"{self._profile_dir}:/profile",
-                        *self._vnc_env_args(),
-                        *self._cdp_env_args(),
-                        *self._port_env_args(),
-                        self._image,
-                    ],
-                    timeout=180,
-                )
-                if code != 0:
-                    raise RuntimeError(
-                        f"foxbridge sidecar could not be created "
-                        f"(image: {self._image}): {out[:300]}"
-                    )
+                self._ensure_profile_dir()
+                self._create_container()
+                fresh_created = True
             else:
                 code, out = _run(
                     ["docker", "start", self._container], timeout=60
@@ -400,7 +424,58 @@ class FoxbridgeBrowserProvider(BrowserProvider):
         # never committed). Kill it so the next browser_exec starts a
         # fresh daemon with a clean connection.
         self._stop_stale_cli_daemon()
-        self._wait_healthy()
+        try:
+            self._wait_healthy()
+        except RuntimeError as exc:
+            # A pre-existing container that just came back (start/restart)
+            # can boot into a broken state — e.g. the entrypoint's Xvfb
+            # lock after `docker stop`, or a corrupted main frame from an
+            # early navigation. A clean recreate usually fixes it; a fresh
+            # create failing again is a real problem, so re-raise.
+            if fresh_created:
+                raise
+            logger.warning(
+                "foxbridge health check failed after start/restart (%s) — "
+                "recreating sidecar", exc,
+            )
+            self._recreate_container()
+            self._ensure_profile_dir()
+            self._create_container()
+            self._stop_stale_cli_daemon()
+            self._wait_healthy()
+
+    def _ensure_profile_dir(self) -> None:
+        if not os.path.isdir(self._profile_dir):
+            os.makedirs(self._profile_dir, exist_ok=True)
+
+    def _create_container(self) -> None:
+        """``docker run -d`` with the current recipe: bridge networking
+        (the --host patch makes foxbridge bind 0.0.0.0 inside), persistent
+        Camoufox profile volume (cookies/ad-sync state and uBO filter lists
+        survive restarts), VNC/CDP env, loopback-only port mappings."""
+        code, out = _run(
+            [
+                "docker", "run", "-d",
+                "--name", self._container,
+                "--restart", "unless-stopped",
+                # bridge networking: the --host patch makes foxbridge
+                # bind 0.0.0.0 inside; -p publishes loopback-only.
+                # persistent Camoufox profile: cookies/ad-sync state and
+                # uBO filter lists survive restarts (see README).
+                "-v", f"{self._profile_dir}:/profile",
+                *self._vnc_env_args(),
+                *self._cdp_env_args(),
+                *self._port_env_args(),
+                self._image,
+            ],
+            timeout=180,
+        )
+        if code != 0:
+            raise RuntimeError(
+                f"foxbridge sidecar could not be created "
+                f"(image: {self._image}): {out[:300]}"
+            )
+        logger.info("foxbridge sidecar container %s created", self._container)
 
     def _stop_stale_cli_daemon(self) -> None:
         """Kill the browser-use CLI daemon (browser_harness.daemon) so the
@@ -428,6 +503,20 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                     f"{self._cdp_url}/json/version", timeout=3
                 ) as resp:
                     if resp.status == 200:
+                        # Identity check: ANY service answering on the port
+                        # passes a bare 200 — including the Hermes cron-mode
+                        # Chrome on 9222 or a leftover dev server. Only a
+                        # foxbridge endpoint is usable (the harness resolves
+                        # its WS URL from this body and would otherwise
+                        # attach to the wrong browser and fail with 404).
+                        body = resp.read(4096).decode("utf-8", "replace")
+                        if "foxbridge" not in body:
+                            last_err = (
+                                "endpoint answered but is not foxbridge "
+                                "(another service on the port?)"
+                            )
+                            time.sleep(2)
+                            continue
                         # CDP is up but the Camoufox process may still be
                         # settling — give the browser boot a moment before
                         # declaring the sidecar usable (see BOOT_STABILIZE_S).

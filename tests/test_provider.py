@@ -99,7 +99,9 @@ class IdleLifecycleTest(unittest.TestCase):
         p = FoxbridgeBrowserProvider(idle_timeout_s=900)
         with mock.patch("provider.time.time", return_value=100.0):
             p._last_used = 99.0  # 1s ago -> under timeout
-            with mock.patch("provider._run") as run:
+            with mock.patch.object(
+                p, "_container_state", return_value="running"
+            ), mock.patch("provider._run") as run:
                 p._idle_tick()
         run.assert_not_called()
 
@@ -239,10 +241,29 @@ class EnsureRunningTest(unittest.TestCase):
     def test_wait_healthy_success(self, urlopen, sleep):
         resp = mock.MagicMock()
         resp.status = 200
+        resp.read.return_value = (
+            b'{"Browser": "foxbridge/1.0", '
+            b'"webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/foxbridge"}'
+        )
         urlopen.return_value.__enter__.return_value = resp
         FoxbridgeBrowserProvider()._wait_healthy()  # must not raise
         # boot stabilization sleep runs before declaring healthy
         sleep.assert_called_once_with(provider.BOOT_STABILIZE_S)
+
+    @mock.patch("provider.time.sleep")
+    @mock.patch("provider.urllib.request.urlopen")
+    def test_wait_healthy_rejects_foreign_endpoint(self, urlopen, sleep):
+        """A non-foxbridge service on the port (e.g. cron-mode Chrome) must
+        never be declared healthy — the harness would attach to the wrong
+        browser and fail with WS 404."""
+        resp = mock.MagicMock()
+        resp.status = 200
+        resp.read.return_value = b'{"Browser": "Chrome/148.0.7778.96", "webSocketDebuggerUrl": "ws://x"}'
+        urlopen.return_value.__enter__.return_value = resp
+        p = FoxbridgeBrowserProvider()
+        with mock.patch("provider.HEALTH_TIMEOUT_S", 0.02):
+            with self.assertRaisesRegex(RuntimeError, "not foxbridge"):
+                p._wait_healthy()
 
     @mock.patch("provider.time.sleep")
     @mock.patch(
@@ -402,6 +423,132 @@ class CdpPortTest(unittest.TestCase):
         self.assertIn("-e FOXBRIDGE_CDP_PORT=9222", run_cmd)
         self.assertIn("-p 127.0.0.1:9222:9222", run_cmd)
         healthy.assert_called_once()
+
+
+class ResilienceTest(unittest.TestCase):
+    """2026-08-13 hardening: idle-timeout floor (core override), auto-heal
+    of crashed sidecars, health identity check, recreate fallback."""
+
+    # --- Fix 1: the core's idle_timeout_s must not shorten the plugin floor
+
+    def test_idle_timeout_floor_is_plugin_default(self):
+        """A core-provided arg below the plugin default (e.g. 120 s from
+        browser.inactivity_timeout) must NOT shorten the documented 900 s."""
+        p = FoxbridgeBrowserProvider(idle_timeout_s=120)
+        self.assertEqual(p._idle_timeout_s, 900)
+
+    def test_idle_timeout_core_may_extend(self):
+        p = FoxbridgeBrowserProvider(idle_timeout_s=1200)
+        self.assertEqual(p._idle_timeout_s, 1200)
+
+    def test_idle_timeout_respects_env_floor(self):
+        with mock.patch.object(provider, "DEFAULT_IDLE_TIMEOUT_S", 300):
+            p = FoxbridgeBrowserProvider(idle_timeout_s=120)
+            self.assertEqual(p._idle_timeout_s, 300)
+
+    def test_init_logs_effective_idle_timeout(self):
+        """The effective timeout must be visible in logs — the silent 120 s
+        override cost a full debugging session on 2026-08-13."""
+        with self.assertLogs("provider", level="INFO") as cm:
+            FoxbridgeBrowserProvider(idle_timeout_s=120)
+        self.assertTrue(
+            any("idle_timeout_s=900" in m for m in cm.output),
+            f"expected effective timeout in log, got: {cm.output}",
+        )
+
+    # --- Fix 2: auto-heal a crashed sidecar while a session is open
+
+    def test_tick_auto_heals_crashed_container_with_session_open(self):
+        p = FoxbridgeBrowserProvider()
+        p._last_used = 1000.0  # recent — not an idle situation
+        p._session_open = True
+        with mock.patch.object(p, "_container_state", return_value="exited"), \
+             mock.patch.object(p, "_container_exit_code", return_value="1"), \
+             mock.patch.object(p, "_ensure_running") as ensure, \
+             mock.patch("provider._run") as run:
+            p._idle_tick()
+        ensure.assert_called_once()
+        run.assert_not_called()  # no docker stop for an already-dead container
+
+    def test_tick_does_not_heal_clean_idle_stop(self):
+        """Exit 0 = the watcher's own clean idle-stop — no resurrection."""
+        p = FoxbridgeBrowserProvider()
+        p._last_used = 1000.0
+        p._session_open = True
+        with mock.patch.object(p, "_container_state", return_value="exited"), \
+             mock.patch.object(p, "_container_exit_code", return_value="0"), \
+             mock.patch.object(p, "_ensure_running") as ensure, \
+             mock.patch("provider._run") as run:
+            p._idle_tick()
+        ensure.assert_not_called()
+        run.assert_not_called()
+
+    def test_tick_does_not_heal_when_session_closed(self):
+        p = FoxbridgeBrowserProvider()
+        p._last_used = 1000.0
+        p._session_open = False
+        with mock.patch.object(p, "_container_state", return_value="exited"), \
+             mock.patch.object(p, "_container_exit_code", return_value="1"), \
+             mock.patch.object(p, "_ensure_running") as ensure, \
+             mock.patch("provider._run") as run:
+            p._idle_tick()
+        ensure.assert_not_called()
+        run.assert_not_called()
+
+    def test_session_open_lifecycle(self):
+        p = FoxbridgeBrowserProvider()
+        self.assertFalse(p._session_open)
+        with mock.patch.object(p, "_ensure_running"), mock.patch.object(
+            p, "_touch"
+        ):
+            p.create_session("t1")
+        self.assertTrue(p._session_open)
+        p.close_session("t1")
+        self.assertFalse(p._session_open)
+        with mock.patch.object(p, "_ensure_running"), mock.patch.object(
+            p, "_touch"
+        ):
+            p.create_session("t2")
+        p.emergency_cleanup("t2")
+        self.assertFalse(p._session_open)
+
+    # --- Fix 5: recreate fallback when a resurrected container is unhealthy
+
+    @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy",
+                       side_effect=[RuntimeError("boom"), None])
+    @mock.patch("provider._run", return_value=(0, ""))
+    def test_health_failure_after_start_recreates(self, run, healthy):
+        """docker start brings the container up but health fails (Xvfb lock
+        / corrupted frame) → clean recreate must be attempted before giving
+        up."""
+        p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-heal-profile")
+        with mock.patch.object(p, "_container_state", return_value="exited"), \
+             mock.patch.object(p, "_container_has_profile_mount", return_value=True), \
+             mock.patch.object(p, "_container_has_host_network", return_value=False):
+            p._ensure_running()
+        cmds = [c[0][0] for c in run.call_args_list]
+        self.assertEqual(cmds[0][:2], ["docker", "start"])
+        # recreate path: rm -f followed by a fresh docker run
+        recreate_idx = next(
+            i for i, c in enumerate(cmds) if c[:3] == ["docker", "rm", "-f"]
+        )
+        self.assertEqual(cmds[recreate_idx + 1][:2], ["docker", "run"])
+        self.assertEqual(healthy.call_count, 2)
+
+    @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy",
+                       side_effect=RuntimeError("boom"))
+    @mock.patch("provider._run", return_value=(0, ""))
+    def test_health_failure_after_fresh_create_reraises(self, run, healthy):
+        """A fresh create failing health is a real problem — re-raise, do
+        not loop."""
+        p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-fail-profile")
+        with mock.patch.object(p, "_container_state", return_value="absent"):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                p._ensure_running()
+        cmds = [c[0][0] for c in run.call_args_list]
+        # exactly one create attempt, no rm -f loop
+        self.assertEqual([c[:3] for c in cmds].count(["docker", "rm", "-f"]), 0)
+        self.assertEqual(healthy.call_count, 1)
 
 
 if __name__ == "__main__":
