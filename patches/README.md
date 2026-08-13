@@ -1,19 +1,20 @@
-# Foxbridge Patches — why they exist and how to maintain them
+# Foxbridge Fixes — why they exist and how to maintain them
 
-**Read this before rebuilding the binary or touching the image.** All three
-patches are **mandatory** — the plugin is broken without any one of them. They
-apply to upstream foxbridge commit `7dee166567d837ecfd0cce3664a6e03fc441e97b`
-in this exact order:
+**The three fixes are mandatory — the plugin is broken without any one of
+them.** They live as **commits on the maintained fork
+[`lgwacker/foxbridge`](https://github.com/lgwacker/foxbridge)** (main),
+based on upstream foxbridge commit `7dee166567d837ecfd0cce3664a6e03fc441e97b`:
 
-```bash
-git apply patches/foxbridge-fetch-noop.patch          # FIRST
-git apply patches/foxbridge-mainframe-context.patch   # SECOND
-git apply patches/foxbridge-host-flag.patch           # THIRD
-```
+| Fix | Fork commit |
+|---|---|
+| Fetch.enable no-op | `a41f9e6` (chain: `33f703f`, `57ebbbc`, `a41f9e6`) |
+| Main-frame context | `a9020bd` |
+| `--host` flag | `d50f813` |
 
-The committed binary (`docker/foxbridge`) and the published image
-(`ghcr.io/lgwacker/foxbridge-camoufox:latest`) already contain all three.
-You only need the patches if you **rebuild** the binary yourself.
+The `.patch` files in this directory are the **upstream-facing diffs** — kept
+for the upstream issues/PRs and as documentation. Nothing applies them at
+build time anymore: `scripts/build-image.sh` and the CI clone the fork at
+`FOXBRIDGE_REF` (= fork main tip `c1f51a8`) and `go build` directly.
 
 ---
 
@@ -136,29 +137,28 @@ camofox-browser server container.
 
 ---
 
-## Updating the upstream foxbridge version
+## Updating the upstream foxbridge version (fork rebase)
 
-If you bump `FOXBRIDGE_REF` (in `scripts/build-image.sh`):
+The fork's main tracks upstream. To bump the upstream base:
 
-1. `git apply` all three patches in order; fix any rejects manually (the
-   `index` lines in each patch show the base hashes).
-2. Rebuild: `scripts/build-image.sh` (needs Docker only — Go build runs
-   in a throwaway `golang:1.26` container, nothing installed on host).
-3. Re-test the triage: `example.com`, `reddit.com/r/technology/`,
-   `olx.com.br/brasil?q=...` via `BU_CDP_URL` + browser-use CLI —
-   first-try navigation on all three, no `id-N` errors.
-4. Commit the new binary (`docker/foxbridge`) — the CI image build uses
-   the **committed** binary, it does NOT rebuild from upstream
-   (deliberate: `go install @latest` would silently drop all three).
-5. Push → `docker-image` workflow rebuilds and republishes
-   `ghcr.io/lgwacker/foxbridge-camoufox:latest`.
+1. In `~/repos/foxbridge` (or a fresh clone): `git fetch upstream`,
+   `git rebase upstream/main` — fix any conflicts manually (the fix
+   commits are small; the `.patch` files here are the reference diffs).
+2. Rebuild + re-test the triage: `scripts/build-image.sh`, then
+   `example.com`, `reddit.com/r/technology/`, `olx.com.br/brasil?q=...`
+   via `BU_CDP_URL` + browser-use CLI — first-try navigation on all
+   three, no `id-N` errors.
+3. Push the fork, then update `FOXBRIDGE_REF` in
+   `scripts/build-image.sh` to the new fork main tip and commit it here.
+4. Push → the `docker-image` workflow rebuilds and republishes
+   `ghcr.io/lgwacker/foxbridge-camoufox:latest` from the new ref.
 
 ## TL;DR checklist if the browser acts up
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Navigation hangs on `about:blank` forever | Fetch.enable not no-op (patch 1 missing in binary) | Rebuild with `foxbridge-fetch-noop.patch` |
-| `Failed to find execution context id-N` / ad iframes in results | Patch 2 missing | Rebuild with `foxbridge-mainframe-context.patch` |
-| CDP endpoint unreachable through `-p` (loopback-only bind) | Patch 3 missing in binary | Rebuild with `foxbridge-host-flag.patch` |
+| Navigation hangs on `about:blank` forever | Fetch.enable not no-op (fix 1 missing in binary) | Rebuild from the fork (`build-image.sh`) |
+| `Failed to find execution context id-N` / ad iframes in results | Fix 2 missing | Rebuild from the fork (`build-image.sh`) |
+| CDP endpoint unreachable through `-p` (loopback-only bind) | Fix 3 missing in binary | Rebuild from the fork (`build-image.sh`) |
 | OLX/Reddit work, other sites flaky | Stale browser-use daemon after sidecar restart | `pkill -f "browser_harness[.]daemon"` + restart sidecar |
 | Old tabs (Google Sign-In, ad pages) resurrect after restart | Camoufox sessionstore restore | Delete `recovery*.lz4` / `sessionstore*` in the profile dir before restart |

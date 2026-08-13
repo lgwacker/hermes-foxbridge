@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "docker/**"
+      - "scripts/**"
       - ".github/workflows/docker-image.yml"
   workflow_dispatch:
 
@@ -20,10 +21,12 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Build and push image
-        run: |
-          # docker/foxbridge is the patched binary committed to the repo
-          # (Fetch.enable no-op + mainframe-context fix). Do NOT rebuild
-          # from upstream @latest — that would drop the patches.
-          docker build -t ghcr.io/lgwacker/foxbridge-camoufox:latest docker/
-          docker push ghcr.io/lgwacker/foxbridge-camoufox:latest
+      # build-image.sh clones lgwacker/foxbridge @ FOXBRIDGE_REF (the fork
+      # carries all three mandatory fixes as commits), builds the binary in a
+      # throwaway golang container, and builds the image — same path as local
+      # builds, no binary committed to this repo.
+      - name: Build image from fork
+        run: ./scripts/build-image.sh
+
+      - name: Push image
+        run: docker push ghcr.io/lgwacker/foxbridge-camoufox:latest

@@ -26,7 +26,7 @@ Camoufox (fork anti-detect do Firefox)
 - `plugins/browser/foxbridge/` — plugin do Hermes (`kind: backend`, `provides_browser_providers: [foxbridge]`). Selecione com `browser.cloud_provider: foxbridge`.
 - `docker/Dockerfile` — imagem `foxbridge-camoufox`: foxbridge + bundle Camoufox (construída sobre a imagem camofox-browser), publicada em `ghcr.io/lgwacker/foxbridge-camoufox` pelo CI.
 - `docker/bootstrap.mjs` — bootstrap dinâmico: chama o mesmo `camoufox-js launchOptions()` que o servidor camofox usa, escreve `CAMOU_CONFIG_1..N` / `FONTCONFIG_PATH` / `DISPLAY` no env do sidecar, `firefoxUserPrefs` no perfil e embute o addon uBO no config de fingerprint. Seeds aleatórios por boot = sem identidade fixa.
-- `patches/` — os **três patches obrigatórios** do foxbridge (veja [`patches/README.md`](patches/README.md)): `foxbridge-fetch-noop.patch` (fix do deadlock do Juggler), `foxbridge-mainframe-context.patch` (fix do drift para iframes de anúncio) e `foxbridge-host-flag.patch` (rede bridge: o sidecar usa mapeamentos `-p` em vez de `--network host`). Os três estão embutidos no binário commitado e na imagem publicada.
+- `patches/` — os **três fixes obrigatórios** do foxbridge (veja [`patches/README.md`](patches/README.md)): no-op do `Fetch.enable` (fix do deadlock do Juggler), contexto de `Runtime.evaluate` na main frame (fix do drift para iframes de anúncio) e a flag `--host` (rede bridge: o sidecar usa mapeamentos `-p` em vez de `--network host`). São mantidos como **commits no fork [`lgwacker/foxbridge`](https://github.com/lgwacker/foxbridge)** (main, fixado por `FOXBRIDGE_REF` em `scripts/build-image.sh`) — o binário é compilado a partir do fork, nada é commitado neste repo.
 - O ciclo de vida do provider espelha a integração camofox: o sidecar **sobe no primeiro uso** e **para após `FOXBRIDGE_IDLE_TIMEOUT_S`** (padrão 900 s) sem atividade.
 
 ## Instalação
@@ -126,18 +126,19 @@ python -m pytest tests/ -q          # testes unitários (sem Docker, sem Hermes)
 ./scripts/build-image.sh            # build local da imagem do sidecar
 ```
 
-`build-image.sh` reconstrói o binário foxbridge a partir do upstream `7dee166`
-e aplica **ambos** os patches em ordem (noop primeiro, mainframe segundo) —
-veja [`patches/README.md`](patches/README.md) para saber por que a ordem
-importa e como atualizar a ref do upstream.
+`build-image.sh` clona o **fork** `lgwacker/foxbridge` na `FOXBRIDGE_REF`
+fixada (cujo `main` carrega os três fixes como commits) e compila o binário
+em um container golang descartável — sem passo de patch, sem binário no git.
+Para subir a base upstream, faça rebase do fork sobre o upstream e atualize
+a `FOXBRIDGE_REF` (veja [`patches/README.md`](patches/README.md)).
 
 CI: testes unitários a cada push; build+push da imagem ao GHCR no `main`
-(usa o binário **commitado** `docker/foxbridge` — deliberadamente NÃO
-`go install @latest`, que descartaria os patches silenciosamente).
+(o binário é compilado a partir do fork dentro da CI — mesmo caminho
+`build-image.sh` do build local).
 
 ## Roadmap
 
-- [x] Flag `--host` — feita localmente via `patches/foxbridge-host-flag.patch`: o sidecar agora usa rede bridge com `-p` só-loopback (sem mais `--network host`)
+- [x] Flag `--host` — implementada no fork (`lgwacker/foxbridge`, commit `d50f813`): o sidecar agora usa rede bridge com `-p` só-loopback (sem mais `--network host`)
 - [ ] Upstream foxbridge: binários de release (elimina o passo de build golang)
 - [ ] Contextos de browser por sessão (`Target.createBrowserContext`) para isolamento de cookies
 - [ ] Tags de imagem por versão do Camoufox
