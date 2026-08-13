@@ -12,10 +12,12 @@
 #
 # Build:  docker build -t ghcr.io/lgwacker/foxbridge-camoufox:latest docker/
 # Run:    docker run -d --name foxbridge --restart unless-stopped \
-#             --network host -v ~/.hermes/foxbridge-profiles:/profile \
+#             -p 127.0.0.1:9222:9222 -p 127.0.0.1:6081:6081 \
+#             -v ~/.hermes/foxbridge-profiles:/profile \
 #             ghcr.io/lgwacker/foxbridge-camoufox:latest
-#         (foxbridge binds 127.0.0.1 only -> --network host is required
-#          until upstream adds a --host flag)
+#         (the provider publishes these ports itself; the local --host
+#          patch makes foxbridge bind 0.0.0.0 inside the container so
+#          docker-proxy can reach it over the bridge network)
 #
 # The foxbridge binary must exist in the build context (docker/foxbridge).
 # Build it with scripts/build-image.sh or the CI workflow.
@@ -41,4 +43,4 @@ RUN node -e "const m=require('camoufox-js/dist/addons.js'); m.addDefaultAddons([
 # /tmp/.X0-lock behind and the next boot crashes the Camoufox
 # ("failed to enable Browser domain: client closed").
 ENTRYPOINT ["sh", "-c"]
-CMD ["rm -f /tmp/.X0-lock /tmp/.X11-unix/X0; rm -f /profile/sessionstore.jsonlz4 /profile/sessionstore-backups/recovery.jsonlz4 /profile/sessionstore-backups/recovery.baklz4; mkdir -p /profile; node /usr/local/bin/foxbridge-bootstrap.mjs; . /etc/foxbridge-env; Xvfb :0 -screen 0 2560x1440x24 >/dev/null 2>&1 & sleep 1; export DISPLAY=:0; exec foxbridge --binary \"$(cat /etc/foxbridge-execpath)\" --profile /profile --port 9222"]
+CMD ["rm -f /tmp/.X0-lock /tmp/.X11-unix/X0; rm -f /profile/sessionstore.jsonlz4 /profile/sessionstore-backups/recovery.jsonlz4 /profile/sessionstore-backups/recovery.baklz4; mkdir -p /profile; node /usr/local/bin/foxbridge-bootstrap.mjs; . /etc/foxbridge-env; Xvfb :0 -screen 0 2560x1440x24 >/dev/null 2>&1 & sleep 1; export DISPLAY=:0; [ \"${FOXBRIDGE_VNC:-0}\" != \"0\" ] && { VNC_PORT=\"${VNC_PORT:-5901}\" NOVNC_PORT=\"${NOVNC_PORT:-6081}\" VNC_BIND=\"${VNC_BIND:-127.0.0.1}\" VNC_RESOLUTION=2560x1440x24 sh /app/plugins/vnc/vnc-watcher.sh >/tmp/camofox-vnc-watcher.log 2>&1 & }; exec foxbridge --host 0.0.0.0 --binary \"$(cat /etc/foxbridge-execpath)\" --profile /profile --port \"${FOXBRIDGE_CDP_PORT:-9222}\""]

@@ -26,7 +26,7 @@ Camoufox (anti-detect Firefox fork)
 - `plugins/browser/foxbridge/` — Hermes plugin (`kind: backend`, `provides_browser_providers: [foxbridge]`). Select with `browser.cloud_provider: foxbridge`.
 - `docker/Dockerfile` — `foxbridge-camoufox` image: foxbridge + Camoufox bundle (built on the camofox-browser image), published to `ghcr.io/lgwacker/foxbridge-camoufox` by CI.
 - `docker/bootstrap.mjs` — dynamic bootstrap: calls the same `camoufox-js launchOptions()` the camofox server uses, writes `CAMOU_CONFIG_1..N` / `FONTCONFIG_PATH` / `DISPLAY` to the sidecar env, `firefoxUserPrefs` to the profile, and bakes the uBO addon into the fingerprint config. Fresh random seeds per boot = no fixed identity.
-- `patches/` — the **two mandatory foxbridge patches** (see [`patches/README.md`](patches/README.md)): `foxbridge-fetch-noop.patch` (Juggler deadlock fix) and `foxbridge-mainframe-context.patch` (ad-iframe drift fix). Both are baked into the committed binary and the published image.
+- `patches/` — the **three mandatory foxbridge patches** (see [`patches/README.md`](patches/README.md)): `foxbridge-fetch-noop.patch` (Juggler deadlock fix), `foxbridge-mainframe-context.patch` (ad-iframe drift fix) and `foxbridge-host-flag.patch` (bridge networking: the sidecar uses `-p` mappings instead of `--network host`). All three are baked into the committed binary and the published image.
 - Provider lifecycle mirrors the camofox integration: the sidecar **starts on first use** and **stops after `FOXBRIDGE_IDLE_TIMEOUT_S`** (default 900 s) of inactivity.
 
 ## Install
@@ -59,9 +59,40 @@ browser tools work without it).
 | Var | Default | Purpose |
 |---|---|---|
 | `FOXBRIDGE_CDP_URL` | `http://127.0.0.1:9222` | CDP endpoint the provider hands to Hermes |
+| `FOXBRIDGE_CDP_PORT` | `9222` | CDP port the sidecar binds (move it away from the Hermes cron Chrome) |
 | `FOXBRIDGE_CONTAINER` | `foxbridge` | Docker container name |
 | `FOXBRIDGE_IMAGE` | `ghcr.io/lgwacker/foxbridge-camoufox:latest` | Sidecar image |
 | `FOXBRIDGE_IDLE_TIMEOUT_S` | `900` | Idle seconds before the sidecar is stopped |
+| `FOXBRIDGE_VNC` | `0` | `1` enables the sidecar VNC/noVNC for interactive logins |
+| `FOXBRIDGE_VNC_PORT` | `5901` | x11vnc port (host loopback) |
+| `FOXBRIDGE_VNC_NOVNC_PORT` | `6081` | noVNC web port (host loopback) |
+| `FOXBRIDGE_VNC_BIND` | `127.0.0.1` | noVNC bind address |
+| `FOXBRIDGE_VNC_PASSWORD` | — | optional x11vnc password |
+| `FOXBRIDGE_VNC_VIEW_ONLY` | `0` | `1` = view-only VNC |
+
+## Interactive logins via VNC (optional)
+
+Some sites need a manual login (2FA, CAPTCHAs, unusual SSO). The sidecar
+image ships the camofox VNC stack (x11vnc + noVNC) — the provider turns it
+on with `FOXBRIDGE_VNC=1`:
+
+1. Set `FOXBRIDGE_VNC=1` (e.g. in `~/.hermes/.env`) and start a browser
+   session. The sidecar now also listens on `127.0.0.1:5901` (x11vnc) and
+   `127.0.0.1:6081` (noVNC).
+2. Open <http://127.0.0.1:6081/vnc.html> and log in manually — that is the
+   same Camoufox instance the CDP side drives.
+3. The login persists in the profile volume
+   (`~/.hermes/foxbridge-profiles/`), so later automated sessions start
+   logged in.
+
+Notes:
+
+- VNC binds host loopback only, and dies with the sidecar: idle-stop after
+  `FOXBRIDGE_IDLE_TIMEOUT_S` or the restart every `create_session` runs.
+  Raise `FOXBRIDGE_IDLE_TIMEOUT_S` while logging in interactively, and set
+  `FOXBRIDGE_VNC_PASSWORD` if you bind beyond loopback.
+- Ports 5901/6081 avoid the camofox-browser server's 5900/6080 (the sidecar
+  shares the host network namespace).
 
 ## Known pitfalls
 
@@ -78,6 +109,12 @@ browser tools work without it).
   the harness can then attach to an ad iframe instead of the main page.
   Delete `recovery*.lz4` / `sessionstore*` in `~/.hermes/foxbridge-profiles/`
   before restarting the sidecar manually.
+- **Port 9222 conflict with the Hermes cron Chrome** — the gateway's
+  cron-mode Chrome (`chrome-debug-cron`) binds `127.0.0.1:9222` while its
+  daemon is up, so the sidecar's foxbridge cannot bind and sessions fail
+  (`address already in use` in `docker logs foxbridge`). Set
+  `FOXBRIDGE_CDP_PORT` (e.g. `9223`) — the provider passes it into the
+  container and derives the CDP endpoint from it.
 - **Stale browser-use daemon** — after a manual sidecar restart, kill the
   harness daemon (`pkill -f "browser_harness[.]daemon"`); the provider does
   this automatically in `create_session`.
@@ -100,7 +137,8 @@ CI: unit tests on every push; image build+push to GHCR on `main` (uses the
 
 ## Roadmap
 
-- [ ] Upstream foxbridge: `--host` flag (drops the `--network host` requirement) and release binaries (drops the golang build step)
+- [x] `--host` flag — done locally via `patches/foxbridge-host-flag.patch`: the sidecar now runs bridge networking with loopback-only `-p` (no more `--network host`)
+- [ ] Upstream foxbridge: release binaries (drops the golang build step)
 - [ ] Per-session browser contexts (`Target.createBrowserContext`) for cookie isolation
 - [ ] Image tags per Camoufox version
 

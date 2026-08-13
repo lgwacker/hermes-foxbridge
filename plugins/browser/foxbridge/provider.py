@@ -24,13 +24,16 @@ import subprocess
 import threading
 import time
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.browser_provider import BrowserProvider
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CDP_URL = os.environ.get("FOXBRIDGE_CDP_URL", "http://127.0.0.1:9222")
+DEFAULT_CDP_PORT = os.environ.get("FOXBRIDGE_CDP_PORT", "9222")
+DEFAULT_CDP_URL = os.environ.get(
+    "FOXBRIDGE_CDP_URL", f"http://127.0.0.1:{DEFAULT_CDP_PORT}"
+)
 DEFAULT_CONTAINER = os.environ.get("FOXBRIDGE_CONTAINER", "foxbridge")
 DEFAULT_IMAGE = os.environ.get(
     "FOXBRIDGE_IMAGE",
@@ -41,6 +44,13 @@ DEFAULT_PROFILE_DIR = os.environ.get(
     os.path.join(os.path.expanduser("~"), ".hermes", "foxbridge-profiles"),
 )
 DEFAULT_IDLE_TIMEOUT_S = int(os.environ.get("FOXBRIDGE_IDLE_TIMEOUT_S", "900"))
+# VNC (interactive logins): the image ships the VNC stack from the
+# camofox-browser base; the sidecar entrypoint starts it only when
+# FOXBRIDGE_VNC is enabled. Defaults avoid the ports the camofox-browser
+# server uses (5900/6080); host exposure is via -p (loopback by default).
+DEFAULT_VNC_PORT = os.environ.get("FOXBRIDGE_VNC_PORT", "5901")
+DEFAULT_VNC_NOVNC_PORT = os.environ.get("FOXBRIDGE_VNC_NOVNC_PORT", "6081")
+DEFAULT_VNC_BIND = os.environ.get("FOXBRIDGE_VNC_BIND", "127.0.0.1")
 HEALTH_TIMEOUT_S = 90
 IDLE_POLL_S = 30
 # The foxbridge CDP endpoint answers as soon as the proxy is up, but the
@@ -77,12 +87,20 @@ class FoxbridgeBrowserProvider(BrowserProvider):
     def __init__(
         self,
         cdp_url: Optional[str] = None,
+        cdp_port: Optional[str] = None,
         container: Optional[str] = None,
         image: Optional[str] = None,
         profile_dir: Optional[str] = None,
         idle_timeout_s: Optional[int] = None,
     ) -> None:
-        self._cdp_url = cdp_url or DEFAULT_CDP_URL
+        # Port/env read at construction (not import) so tests and config
+        # changes can move the CDP endpoint without a process restart.
+        self._cdp_port = cdp_port or os.environ.get(
+            "FOXBRIDGE_CDP_PORT"
+        ) or DEFAULT_CDP_PORT
+        self._cdp_url = cdp_url or os.environ.get("FOXBRIDGE_CDP_URL") or (
+            f"http://127.0.0.1:{self._cdp_port}"
+        )
         self._container = container or DEFAULT_CONTAINER
         self._image = image or DEFAULT_IMAGE
         self._profile_dir = profile_dir or DEFAULT_PROFILE_DIR
@@ -103,12 +121,15 @@ class FoxbridgeBrowserProvider(BrowserProvider):
     def create_session(self, task_id: str) -> Dict[str, object]:
         self._ensure_running()
         self._touch()
+        features: Dict[str, str] = {}
+        if self._vnc_enabled():
+            features["vnc_url"] = self._vnc_url()
         return {
             "session_name": f"foxbridge-{task_id}",
             "bb_session_id": f"foxbridge-{task_id}",
             "cdp_url": self._cdp_url,
             "expires_at": "",
-            "features": {},
+            "features": features,
         }
 
     def close_session(self, session_id: str) -> bool:
@@ -137,6 +158,11 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                     "key": "FOXBRIDGE_IMAGE",
                     "prompt": "Container image (foxbridge + Camoufox)",
                     "default": DEFAULT_IMAGE,
+                },
+                {
+                    "key": "FOXBRIDGE_VNC",
+                    "prompt": "Enable the sidecar VNC/noVNC for interactive logins (1 or 0)",
+                    "default": "0",
                 },
             ],
         }
@@ -203,6 +229,28 @@ class FoxbridgeBrowserProvider(BrowserProvider):
         )
         return code == 0 and "/profile" in out
 
+    def _container_has_host_network(self) -> bool:
+        """True when the existing container was created with --network
+        host (the pre-bridge recipe) — such a container must be recreated
+        so the -p port mappings and the new entrypoint apply."""
+        code, out = _run(
+            [
+                "docker", "inspect", "-f",
+                "{{.HostConfig.NetworkMode}}",
+                self._container,
+            ],
+            timeout=15,
+        )
+        return code == 0 and out.strip() == "host"
+
+    def _container_is_stale(self) -> bool:
+        """Container created by an older recipe (host network, or no
+        persistent profile mount) must be dropped and rebuilt."""
+        return (
+            self._container_has_host_network()
+            or not self._container_has_profile_mount()
+        )
+
     def _recreate_container(self) -> None:
         """Drop a stale container (wrong image/entrypoint/mounts) and let the
         create path rebuild it. Best-effort — never raises."""
@@ -215,6 +263,58 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                 code, out[:120],
             )
 
+    def _vnc_enabled(self) -> bool:
+        """VNC opt-in: FOXBRIDGE_VNC on the host set to anything but '0'."""
+        return os.environ.get("FOXBRIDGE_VNC", "0") != "0"
+
+    def _vnc_env_args(self) -> List[str]:
+        """Docker -e args turning on the sidecar VNC stack (x11vnc +
+        noVNC) for interactive logins. The image ships the VNC bits (base
+        camofox-browser image); the entrypoint starts the vnc-watcher
+        against the Xvfb display only when FOXBRIDGE_VNC != '0'.
+        websockify binds 0.0.0.0 INSIDE the container so docker-proxy can
+        reach it over the bridge; host exposure is the -p mapping."""
+        if not self._vnc_enabled():
+            return []
+        args = ["-e", "FOXBRIDGE_VNC=1", "-e", "VNC_BIND=0.0.0.0"]
+        mapping = [
+            ("FOXBRIDGE_VNC_PORT", "VNC_PORT", DEFAULT_VNC_PORT),
+            ("FOXBRIDGE_VNC_NOVNC_PORT", "NOVNC_PORT", DEFAULT_VNC_NOVNC_PORT),
+            ("FOXBRIDGE_VNC_PASSWORD", "VNC_PASSWORD", ""),
+            ("FOXBRIDGE_VNC_VIEW_ONLY", "VIEW_ONLY", ""),
+        ]
+        for host_key, container_key, default in mapping:
+            val = os.environ.get(host_key, default)
+            if val:
+                args += ["-e", f"{container_key}={val}"]
+        return args
+
+    def _vnc_url(self) -> str:
+        bind = os.environ.get("FOXBRIDGE_VNC_BIND", DEFAULT_VNC_BIND)
+        port = os.environ.get("FOXBRIDGE_VNC_NOVNC_PORT", DEFAULT_VNC_NOVNC_PORT)
+        return f"http://{bind}:{port}/vnc.html"
+
+    def _cdp_env_args(self) -> List[str]:
+        """Keep the entrypoint's foxbridge --port in sync with the
+        provider's endpoint. The Hermes cron-mode Chrome occupies 9222
+        while its daemon is up; FOXBRIDGE_CDP_PORT moves the sidecar to a
+        free port. Always passed so the container matches the provider."""
+        return ["-e", f"FOXBRIDGE_CDP_PORT={self._cdp_port}"]
+
+    def _port_env_args(self) -> List[str]:
+        """docker -p args. The sidecar runs on the bridge network (NOT
+        --network host): the local --host patch makes foxbridge bind
+        0.0.0.0 inside the container so docker-proxy can reach it. Host
+        exposure is loopback-only unless FOXBRIDGE_VNC_BIND is changed."""
+        args = ["-p", f"127.0.0.1:{self._cdp_port}:{self._cdp_port}"]
+        if self._vnc_enabled():
+            bind = os.environ.get("FOXBRIDGE_VNC_BIND", DEFAULT_VNC_BIND)
+            novnc = os.environ.get(
+                "FOXBRIDGE_VNC_NOVNC_PORT", DEFAULT_VNC_NOVNC_PORT
+            )
+            args += ["-p", f"{bind}:{novnc}:{novnc}"]
+        return args
+
     def _ensure_running(self) -> None:
         state = self._container_state()
         if state == "running":
@@ -225,7 +325,7 @@ class FoxbridgeBrowserProvider(BrowserProvider):
             # example.com, ...) make every new navigation land in the
             # wrong tab. Restart the sidecar so each session starts with
             # a clean single-tab browser (~2-3s).
-            if not self._container_has_profile_mount():
+            if self._container_is_stale():
                 self._recreate_container()
                 state = "absent"
             else:
@@ -244,12 +344,14 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                     "docker", "run", "-d",
                     "--name", self._container,
                     "--restart", "unless-stopped",
-                    # foxbridge binds 127.0.0.1 only (no --host flag yet),
-                    # so the sidecar shares the host network namespace.
-                    "--network", "host",
+                    # bridge networking: the --host patch makes foxbridge
+                    # bind 0.0.0.0 inside; -p publishes loopback-only.
                     # persistent Camoufox profile: cookies/ad-sync state and
                     # uBO filter lists survive restarts (see README).
                     "-v", f"{self._profile_dir}:/profile",
+                    *self._vnc_env_args(),
+                    *self._cdp_env_args(),
+                    *self._port_env_args(),
                     self._image,
                 ],
                 timeout=180,
@@ -260,7 +362,7 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                     f"(image: {self._image}): {out[:300]}"
                 )
         elif state == "exited":
-            if not self._container_has_profile_mount():
+            if self._container_is_stale():
                 self._recreate_container()
                 state = "absent"
                 if not os.path.isdir(self._profile_dir):
@@ -270,8 +372,10 @@ class FoxbridgeBrowserProvider(BrowserProvider):
                         "docker", "run", "-d",
                         "--name", self._container,
                         "--restart", "unless-stopped",
-                        "--network", "host",
                         "-v", f"{self._profile_dir}:/profile",
+                        *self._vnc_env_args(),
+                        *self._cdp_env_args(),
+                        *self._port_env_args(),
                         self._image,
                     ],
                     timeout=180,

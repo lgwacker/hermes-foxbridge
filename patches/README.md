@@ -1,17 +1,18 @@
 # Foxbridge Patches — why they exist and how to maintain them
 
-**Read this before rebuilding the binary or touching the image.** Both
-patches are **mandatory** — the plugin is broken without either one. They
+**Read this before rebuilding the binary or touching the image.** All three
+patches are **mandatory** — the plugin is broken without any one of them. They
 apply to upstream foxbridge commit `7dee166567d837ecfd0cce3664a6e03fc441e97b`
 in this exact order:
 
 ```bash
 git apply patches/foxbridge-fetch-noop.patch          # FIRST
 git apply patches/foxbridge-mainframe-context.patch   # SECOND
+git apply patches/foxbridge-host-flag.patch           # THIRD
 ```
 
 The committed binary (`docker/foxbridge`) and the published image
-(`ghcr.io/lgwacker/foxbridge-camoufox:latest`) already contain both.
+(`ghcr.io/lgwacker/foxbridge-camoufox:latest`) already contain all three.
 You only need the patches if you **rebuild** the binary yourself.
 
 ---
@@ -98,11 +99,48 @@ frame).
 
 ---
 
+## Patch 3: `foxbridge-host-flag.patch` — `--host` flag (bridge networking)
+
+**Files:** `cmd/foxbridge/main.go`
+
+### The problem
+
+foxbridge hardcodes `127.0.0.1` as the CDP bind host (`pkg/cdp/server.go`
+defaults the `Server.host` field; the CLI had no flag to override it).
+The `cdp.Server` already exposes `SetHost()`, but `cmd/foxbridge` never
+wired it. With a plain `-p` publish, docker-proxy connects to the
+container's bridge IP — not its loopback — so the CDP endpoint is
+unreachable. The old workaround was `--network host`, which shares the
+host network namespace with the container (bigger attack surface: a
+compromised container can bind/connect anywhere on the host).
+
+### The fix
+
+Add a `--host` flag (default `127.0.0.1`, preserving upstream behaviour)
+and always call `server.SetHost(*host)`. The sidecar entrypoint passes
+`--host 0.0.0.0` (bind inside the container), and the provider publishes
+loopback-only `-p` mappings — the same isolation model as the
+camofox-browser server container.
+
+### How we know (evidence)
+
+- `foxbridge --host 0.0.0.0` inside a bridge-networked container is
+  reachable through `-p 127.0.0.1:9222:9222` (`/json/version` returns the
+  `webSocketDebuggerUrl`; `docker logs` shows
+  `CDP server listening on 0.0.0.0:9222`).
+- Validated e2e with the full stack (CDP + VNC): RFB handshake through
+  noVNC on `127.0.0.1:6081`, page target alive, navigation via the
+  browser-use harness.
+- Upstream has no `--host` flag yet — this patch is the local
+  implementation of the roadmap item; rebase on upstream when it lands.
+
+---
+
 ## Updating the upstream foxbridge version
 
 If you bump `FOXBRIDGE_REF` (in `scripts/build-image.sh`):
 
-1. `git apply` both patches in order; fix any rejects manually (the
+1. `git apply` all three patches in order; fix any rejects manually (the
    `index` lines in each patch show the base hashes).
 2. Rebuild: `scripts/build-image.sh` (needs Docker only — Go build runs
    in a throwaway `golang:1.26` container, nothing installed on host).
@@ -111,7 +149,7 @@ If you bump `FOXBRIDGE_REF` (in `scripts/build-image.sh`):
    first-try navigation on all three, no `id-N` errors.
 4. Commit the new binary (`docker/foxbridge`) — the CI image build uses
    the **committed** binary, it does NOT rebuild from upstream
-   (deliberate: `go install @latest` would silently drop both patches).
+   (deliberate: `go install @latest` would silently drop all three).
 5. Push → `docker-image` workflow rebuilds and republishes
    `ghcr.io/lgwacker/foxbridge-camoufox:latest`.
 
@@ -121,5 +159,6 @@ If you bump `FOXBRIDGE_REF` (in `scripts/build-image.sh`):
 |---|---|---|
 | Navigation hangs on `about:blank` forever | Fetch.enable not no-op (patch 1 missing in binary) | Rebuild with `foxbridge-fetch-noop.patch` |
 | `Failed to find execution context id-N` / ad iframes in results | Patch 2 missing | Rebuild with `foxbridge-mainframe-context.patch` |
+| CDP endpoint unreachable through `-p` (loopback-only bind) | Patch 3 missing in binary | Rebuild with `foxbridge-host-flag.patch` |
 | OLX/Reddit work, other sites flaky | Stale browser-use daemon after sidecar restart | `pkill -f "browser_harness[.]daemon"` + restart sidecar |
 | Old tabs (Google Sign-In, ad pages) resurrect after restart | Camoufox sessionstore restore | Delete `recovery*.lz4` / `sessionstore*` in the profile dir before restart |

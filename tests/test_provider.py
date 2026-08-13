@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -122,15 +123,16 @@ class IdleLifecycleTest(unittest.TestCase):
 class EnsureRunningTest(unittest.TestCase):
     @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
     @mock.patch("provider._run", return_value=(0, ""))
-    def test_absent_creates_with_network_host_and_profile(self, run, healthy):
+    def test_absent_creates_with_port_mappings_and_profile(self, run, healthy):
         p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-test-profile")
         with mock.patch.object(p, "_container_state", return_value="absent"):
             p._ensure_running()
         cmds = [c[0][0] for c in run.call_args_list]
         self.assertEqual(cmds[0][0], "docker")
         self.assertIn("run", cmds[0])
-        self.assertIn("--network", cmds[0])
-        self.assertIn("host", cmds[0])
+        self.assertNotIn("--network", cmds[0])
+        self.assertIn("-p", cmds[0])
+        self.assertIn("127.0.0.1:9222:9222", " ".join(cmds[0]))
         self.assertIn("-v", cmds[0])
         self.assertIn("/profile", " ".join(cmds[0]))
         self.assertIn(p._image, cmds[0])
@@ -140,10 +142,27 @@ class EnsureRunningTest(unittest.TestCase):
 
     @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
     @mock.patch("provider._run", return_value=(0, ""))
+    def test_exited_with_host_network_recreates(self, run, healthy):
+        """A container from the pre-bridge recipe (--network host) must be
+        recreated so the -p mappings and the new entrypoint apply."""
+        p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-test-profile")
+        with mock.patch.object(p, "_container_state", return_value="exited"), \
+             mock.patch.object(p, "_container_has_profile_mount", return_value=True), \
+             mock.patch.object(p, "_container_has_host_network", return_value=True):
+            p._ensure_running()
+        cmds = [c[0][0] for c in run.call_args_list]
+        self.assertEqual(cmds[0][:3], ["docker", "rm", "-f"])
+        self.assertIn("run", cmds[1])
+        self.assertNotIn("--network", cmds[1])
+        healthy.assert_called_once()
+
+    @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
+    @mock.patch("provider._run", return_value=(0, ""))
     def test_exited_with_mount_starts(self, run, healthy):
         p = FoxbridgeBrowserProvider()
         with mock.patch.object(p, "_container_state", return_value="exited"), \
-             mock.patch.object(p, "_container_has_profile_mount", return_value=True):
+             mock.patch.object(p, "_container_has_profile_mount", return_value=True), \
+             mock.patch.object(p, "_container_has_host_network", return_value=False):
             p._ensure_running()
         cmds = [c[0][0] for c in run.call_args_list]
         self.assertEqual(cmds[0][:2], ["docker", "start"])
@@ -157,7 +176,8 @@ class EnsureRunningTest(unittest.TestCase):
         recreated so the persistent profile volume is attached."""
         p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-test-profile")
         with mock.patch.object(p, "_container_state", return_value="exited"), \
-             mock.patch.object(p, "_container_has_profile_mount", return_value=False):
+             mock.patch.object(p, "_container_has_profile_mount", return_value=False), \
+             mock.patch.object(p, "_container_has_host_network", return_value=False):
             p._ensure_running()
         cmds = [c[0][0] for c in run.call_args_list]
         self.assertEqual(cmds[0][:3], ["docker", "rm", "-f"])
@@ -174,7 +194,8 @@ class EnsureRunningTest(unittest.TestCase):
         every session must start from a restarted, single-tab browser."""
         p = FoxbridgeBrowserProvider()
         with mock.patch.object(p, "_container_state", return_value="running"), \
-             mock.patch.object(p, "_container_has_profile_mount", return_value=True):
+             mock.patch.object(p, "_container_has_profile_mount", return_value=True), \
+             mock.patch.object(p, "_container_has_host_network", return_value=False):
             p._ensure_running()
         cmds = [c[0][0] for c in run.call_args_list]
         self.assertEqual(cmds[0][:2], ["docker", "restart"])
@@ -188,7 +209,8 @@ class EnsureRunningTest(unittest.TestCase):
     def test_running_without_mount_recreates(self, run, healthy):
         p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-test-profile")
         with mock.patch.object(p, "_container_state", return_value="running"), \
-             mock.patch.object(p, "_container_has_profile_mount", return_value=False):
+             mock.patch.object(p, "_container_has_profile_mount", return_value=False), \
+             mock.patch.object(p, "_container_has_host_network", return_value=False):
             p._ensure_running()
         cmds = [c[0][0] for c in run.call_args_list]
         self.assertEqual(cmds[0][:3], ["docker", "rm", "-f"])
@@ -231,6 +253,155 @@ class EnsureRunningTest(unittest.TestCase):
         with mock.patch("provider.HEALTH_TIMEOUT_S", 0.01):
             with self.assertRaisesRegex(RuntimeError, "not reachable"):
                 p._wait_healthy()
+
+
+class VncEnvTest(unittest.TestCase):
+    def test_vnc_off_by_default(self):
+        with mock.patch.dict(
+            os.environ, {"FOXBRIDGE_VNC": "0"}, clear=False
+        ):
+            p = FoxbridgeBrowserProvider()
+            self.assertFalse(p._vnc_enabled())
+            self.assertEqual(p._vnc_env_args(), [])
+
+    def test_vnc_gate(self):
+        with mock.patch.dict(
+            os.environ, {"FOXBRIDGE_VNC": "1"}, clear=False
+        ):
+            p = FoxbridgeBrowserProvider()
+            self.assertTrue(p._vnc_enabled())
+            # gate + fixed container bind + non-empty defaults
+            self.assertEqual(
+                p._vnc_env_args(),
+                [
+                    "-e", "FOXBRIDGE_VNC=1",
+                    "-e", "VNC_BIND=0.0.0.0",
+                    "-e", "VNC_PORT=5901",
+                    "-e", "NOVNC_PORT=6081",
+                ],
+            )
+
+    def test_vnc_maps_host_env_to_container_env(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FOXBRIDGE_VNC": "1",
+                "FOXBRIDGE_VNC_PORT": "5905",
+                "FOXBRIDGE_VNC_NOVNC_PORT": "6085",
+                "FOXBRIDGE_VNC_BIND": "0.0.0.0",
+                "FOXBRIDGE_VNC_PASSWORD": "secret",
+                "FOXBRIDGE_VNC_VIEW_ONLY": "1",
+            },
+            clear=False,
+        ):
+            args = FoxbridgeBrowserProvider()._vnc_env_args()
+        joined = " ".join(args)
+        for expected in [
+            "FOXBRIDGE_VNC=1",
+            "VNC_BIND=0.0.0.0",
+            "VNC_PORT=5905",
+            "NOVNC_PORT=6085",
+            "VNC_PASSWORD=secret",
+            "VIEW_ONLY=1",
+        ]:
+            self.assertIn("-e " + expected, joined)
+        # FOXBRIDGE_VNC_BIND now controls the HOST-side -p bind
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FOXBRIDGE_VNC": "1",
+                "FOXBRIDGE_VNC_BIND": "0.0.0.0",
+                "FOXBRIDGE_VNC_NOVNC_PORT": "6085",
+            },
+            clear=False,
+        ):
+            p = FoxbridgeBrowserProvider()
+            self.assertIn(
+                "-p 0.0.0.0:6085:6085", " ".join(p._port_env_args())
+            )
+
+    @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
+    @mock.patch("provider._run", return_value=(0, ""))
+    def test_docker_run_gets_vnc_env_when_enabled(self, run, healthy):
+        p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-vnc-test-profile")
+        with mock.patch.dict(
+            os.environ, {"FOXBRIDGE_VNC": "1"}, clear=False
+        ), mock.patch.object(p, "_container_state", return_value="absent"):
+            p._ensure_running()
+        cmds = [c[0][0] for c in run.call_args_list]
+        run_cmd = " ".join(cmds[0])
+        self.assertIn("-e FOXBRIDGE_VNC=1", run_cmd)
+        self.assertIn("-e NOVNC_PORT=6081", run_cmd)
+        self.assertIn("-p 127.0.0.1:6081:6081", run_cmd)
+        self.assertIn("-p 127.0.0.1:9222:9222", run_cmd)
+        healthy.assert_called_once()
+
+    def test_port_args_without_vnc_only_cdp(self):
+        with mock.patch.dict(
+            os.environ, {"FOXBRIDGE_VNC": "0"}, clear=False
+        ):
+            p = FoxbridgeBrowserProvider()
+            self.assertEqual(
+                p._port_env_args(), ["-p", "127.0.0.1:9222:9222"]
+            )
+
+    def test_create_session_exposes_vnc_url(self):
+        with mock.patch.dict(
+            os.environ, {"FOXBRIDGE_VNC": "1"}, clear=False
+        ):
+            p = FoxbridgeBrowserProvider()
+            with mock.patch.object(p, "_ensure_running") as ensure, mock.patch.object(
+                p, "_touch"
+            ) as touch:
+                info = p.create_session("t1")
+        self.assertEqual(
+            info["features"]["vnc_url"], "http://127.0.0.1:6081/vnc.html"
+        )
+
+
+class CdpPortTest(unittest.TestCase):
+    def test_default_port_9222(self):
+        p = FoxbridgeBrowserProvider()
+        self.assertEqual(p._cdp_port, "9222")
+        self.assertEqual(p._cdp_url, "http://127.0.0.1:9222")
+        self.assertEqual(
+            p._cdp_env_args(), ["-e", "FOXBRIDGE_CDP_PORT=9222"]
+        )
+
+    def test_port_env_derives_url_and_container_env(self):
+        with mock.patch.dict(
+            os.environ, {"FOXBRIDGE_CDP_PORT": "9223"}, clear=False
+        ):
+            p = FoxbridgeBrowserProvider()
+            self.assertEqual(p._cdp_url, "http://127.0.0.1:9223")
+            self.assertEqual(
+                p._cdp_env_args(), ["-e", "FOXBRIDGE_CDP_PORT=9223"]
+            )
+
+    def test_explicit_cdp_url_wins_over_port(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FOXBRIDGE_CDP_PORT": "9223",
+                "FOXBRIDGE_CDP_URL": "http://127.0.0.1:9999",
+            },
+            clear=False,
+        ):
+            p = FoxbridgeBrowserProvider()
+            self.assertEqual(p._cdp_url, "http://127.0.0.1:9999")
+            self.assertEqual(p._cdp_port, "9223")
+
+    @mock.patch.object(FoxbridgeBrowserProvider, "_wait_healthy")
+    @mock.patch("provider._run", return_value=(0, ""))
+    def test_docker_run_gets_cdp_port_env(self, run, healthy):
+        p = FoxbridgeBrowserProvider(profile_dir="/tmp/fb-cdp-test-profile")
+        with mock.patch.object(p, "_container_state", return_value="absent"):
+            p._ensure_running()
+        cmds = [c[0][0] for c in run.call_args_list]
+        run_cmd = " ".join(cmds[0])
+        self.assertIn("-e FOXBRIDGE_CDP_PORT=9222", run_cmd)
+        self.assertIn("-p 127.0.0.1:9222:9222", run_cmd)
+        healthy.assert_called_once()
 
 
 if __name__ == "__main__":

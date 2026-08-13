@@ -41,7 +41,7 @@ manages the sidecar lifecycle for you.
 
 The image is built by the repo's `docker-image` CI workflow from
 `docker/Dockerfile` + `docker/bootstrap.mjs`. The foxbridge binary inside
-carries **two mandatory patches** (applied to upstream foxbridge
+carries **three mandatory patches** (applied to upstream foxbridge
 `7dee166`, see [`patches/README.md`](../../../patches/README.md) for the
 full write-up):
 
@@ -52,6 +52,10 @@ full write-up):
 2. **Main-frame context tracking** — without it, context-less
    `Runtime.evaluate` drifts to ad iframes on ad-heavy pages (OLX, Reddit)
    → `-32000 Failed to find execution context id-N` and wrong page state.
+3. **`--host` bind flag** — without it the CDP server only binds
+   container loopback, so the sidecar had to run with `--network host`;
+   with it the sidecar uses bridge networking + loopback-only `-p`
+   mappings (same isolation model as the camofox server container).
 
 The dynamic bootstrap (`docker/bootstrap.mjs`) calls the same
 `camoufox-js launchOptions()` the camofox server uses
@@ -68,10 +72,33 @@ first try through the browser-use harness. OLX loads without warm-up.
 ## Env vars
 
 `FOXBRIDGE_CDP_URL` (default `http://127.0.0.1:9222`) ·
+`FOXBRIDGE_CDP_PORT` (default `9222`) ·
 `FOXBRIDGE_CONTAINER` (default `foxbridge`) ·
 `FOXBRIDGE_IMAGE` (default `ghcr.io/lgwacker/foxbridge-camoufox:latest`) ·
 `FOXBRIDGE_IDLE_TIMEOUT_S` (default `900`) ·
-`FOXBRIDGE_BOOT_STABILIZE_S` (default `10`)
+`FOXBRIDGE_BOOT_STABILIZE_S` (default `10`) ·
+`FOXBRIDGE_VNC` (default `0`) ·
+`FOXBRIDGE_VNC_PORT` (default `5901`) ·
+`FOXBRIDGE_VNC_NOVNC_PORT` (default `6081`) ·
+`FOXBRIDGE_VNC_BIND` (default `127.0.0.1`) ·
+`FOXBRIDGE_VNC_PASSWORD` (optional) ·
+`FOXBRIDGE_VNC_VIEW_ONLY` (default `0`)
+
+## Interactive logins (VNC)
+
+The sidecar image ships the camofox VNC stack (x11vnc + noVNC) attached to
+the same Xvfb display the browser renders on. Enable it with
+`FOXBRIDGE_VNC=1` (host env, e.g. `~/.hermes/.env`), then open
+<http://127.0.0.1:6081/vnc.html> and log in manually — cookies persist in
+the profile volume, so later automated sessions start logged in. VNC is
+host-loopback only; ports 5901/6081 avoid the camofox-browser server's
+5900/6080. The VNC stack dies with the sidecar (idle-stop or the
+per-session restart), and every new `create_session` restarts the sidecar
+— finish logins before sessions end, or raise `FOXBRIDGE_IDLE_TIMEOUT_S`.
+
+`FOXBRIDGE_CDP_PORT` moves the sidecar's CDP bind (the Hermes cron-mode
+Chrome holds 127.0.0.1:9222 while its daemon is up); the provider passes it
+into the container and derives the CDP endpoint from it.
 
 ## Session hygiene (validated 2026-08-12)
 
@@ -100,6 +127,7 @@ gets a clean, ready browser:
 | `Failed to find execution context id-N` or results show ad iframes (adkernel, google gsi) | Image is stale (pre-mainframe-patch) → `docker pull ghcr.io/lgwacker/foxbridge-camoufox:latest` and restart |
 | Navigation hangs on `about:blank` forever | Image is stale (pre-noop-patch); same fix as above |
 | Old tabs (Google Sign-In, ad pages) resurrect after sidecar restart | Camoufox sessionstore restore: delete `recovery*.lz4` / `sessionstore*` in the profile dir (`~/.hermes/foxbridge-profiles/`) before restart |
+| `docker logs foxbridge` shows `bind: address already in use` | The Hermes cron-mode Chrome holds 127.0.0.1:9222 → set `FOXBRIDGE_CDP_PORT` (e.g. `9223`) |
 | Flaky navigation after manual sidecar restarts | `pkill -f "browser_harness[.]daemon"` before the next `create_session` (the provider does this automatically) |
 | `hermes plugins install` pulls a stale image | The image is rebuilt by CI on every push to `docker/**`; force with `docker pull` + `docker restart foxbridge` |
 

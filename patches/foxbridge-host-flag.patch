@@ -1,0 +1,20 @@
+diff --git a/cmd/foxbridge/main.go b/cmd/foxbridge/main.go
+index 4fbe6ae..12006e1 100644
+--- a/cmd/foxbridge/main.go
++++ b/cmd/foxbridge/main.go
+@@ -28,6 +28,7 @@ func main() {
+ 	}
+ 
+ 	port := flag.Int("port", 9222, "CDP WebSocket port")
++	host := flag.String("host", "127.0.0.1", "TCP host to bind the CDP server to (0.0.0.0 to expose)")
+ 	socket := flag.String("socket", "", "Unix-domain socket path for the CDP HTTP/WebSocket server")
+ 	recordPath := flag.String("record", "", "Path to write a CDP wire recording as JSONL")
+ 	binary := flag.String("binary", "", "Firefox/Camoufox binary path")
+@@ -117,6 +118,7 @@ func main() {
+ 	server := cdp.NewServer(*port, func(conn *cdp.Connection, msg *cdp.Message) {
+ 		b.HandleMessage(conn, msg)
+ 	}, sessions)
++	server.SetHost(*host)
+ 	if *socket != "" {
+ 		server.SetUnixSocket(*socket)
+ 	}
