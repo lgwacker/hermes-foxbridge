@@ -31,6 +31,16 @@ comes back but fails the health check (e.g. the entrypoint's Xvfb lock after
 giving up. Health checks also verify the endpoint identity — a foreign
 service on the port (cron-mode Chrome on 9222) is never declared healthy.
 
+> 🔒 **Ownership guard (0.2.1):** several long-lived Hermes processes
+> (desktop backend, gateway, leftover CLI sessions) can each run a provider
+> with its own idle watcher on the SAME container name. The watcher
+> captures the sidecar's `StartedAt` at every session start and only
+> idle-stops while it still matches — a container started/restarted by
+> another instance (or a manual `docker start`) is never stopped by a
+> stale watcher. Symptom this fixes: the sidecar dying with a clean
+> exit-0 `shutting down...` 7-15 s after every boot while a
+> `browser_exec` is in flight ("no close frame received").
+
 ## Install
 
 ```bash
