@@ -114,6 +114,14 @@ class FoxbridgeBrowserProvider(BrowserProvider):
             idle_timeout_s or 0, DEFAULT_IDLE_TIMEOUT_S
         )
         self._last_used = 0.0
+        # Ownership baseline for the idle watcher: the container's
+        # StartedAt captured at our last _touch(). Several long-lived
+        # Hermes processes (desktop backend, gateway, leftover CLI
+        # sessions) each run a provider with its OWN idle watcher on the
+        # SAME container name — the watcher must never stop a sidecar
+        # another instance (or a manual `docker start`) brought up.
+        self._owned_started_at: Optional[str] = None
+        self._foreign_sidecar = False
         self._session_open = False
         self._lock = threading.Lock()
         self._watcher: Optional[threading.Thread] = None
@@ -195,6 +203,11 @@ class FoxbridgeBrowserProvider(BrowserProvider):
     def _touch(self) -> None:
         with self._lock:
             self._last_used = time.time()
+            # create_session runs _ensure_running() first, which (re)starts
+            # the sidecar — so the StartedAt captured here is the container
+            # THIS instance owns from now on.
+            self._foreign_sidecar = False
+            self._owned_started_at = self._container_started_at()
         self._ensure_watcher()
 
     def _ensure_watcher(self) -> None:
@@ -249,11 +262,47 @@ class FoxbridgeBrowserProvider(BrowserProvider):
             return
         if state != "running":
             return
+        # Ownership guard (v0.2.1): stale watchers from OTHER provider
+        # instances idle-stopped the sidecar 7-15 s after every boot
+        # (docker events: SIGTERM + foxbridge "shutting down..." while a
+        # browser_exec was in flight → "no close frame received"). The X
+        # /quotes page was wrongly blamed on 2026-08-13 — its navigate
+        # landed AFTER the container was already stopping. Never stop a
+        # container whose StartedAt changed since our last touch: another
+        # instance or a manual docker start owns it now.
+        if self._foreign_sidecar:
+            return  # another instance owns the sidecar — leave it alone
+        started_at = self._container_started_at()
+        if started_at != self._owned_started_at:
+            self._foreign_sidecar = True
+            logger.info(
+                "foxbridge sidecar %s started/restarted after this "
+                "instance's last session (owned=%r current=%r) — "
+                "skipping idle-stop",
+                self._container, self._owned_started_at, started_at,
+            )
+            return
         code, out = _run(["docker", "stop", self._container], timeout=60)
         if code == 0:
             logger.info("foxbridge sidecar stopped after %.0fs idle", idle_s)
         else:
             logger.warning("foxbridge idle stop failed: %s", out[:200])
+
+    def _container_started_at(self) -> Optional[str]:
+        """StartedAt (RFC3339 string) of the container, or None when it is
+        absent or not inspectable. Used as the idle-watcher ownership
+        token: a changed value means the sidecar was (re)started by
+        another process since our last touch."""
+        code, out = _run(
+            [
+                "docker", "inspect", "-f", "{{.State.StartedAt}}",
+                self._container,
+            ],
+            timeout=15,
+        )
+        if code != 0:
+            return None
+        return out.strip() or None
 
     def _container_exit_code(self) -> Optional[str]:
         """Exit code of an exited container, or None when not inspectable."""

@@ -114,9 +114,59 @@ class IdleLifecycleTest(unittest.TestCase):
             p._idle_tick()
         run.assert_not_called()
 
+    def test_tick_skips_when_container_owned_by_another_instance(self):
+        # A stale watcher (old CLI/gateway process) must never idle-stop a
+        # sidecar another instance booted — the 2026-08-13 "no close frame
+        # received" flakiness was a watcher killing the container 7-15 s
+        # after every boot, not the X /quotes page.
+        p = FoxbridgeBrowserProvider(idle_timeout_s=60)
+        p._last_used = 0.0  # ancient -> idle-stop would fire
+        p._owned_started_at = None  # this instance never started it
+        with mock.patch.object(p, "_container_state", return_value="running"), mock.patch.object(
+            p, "_container_started_at", return_value="2026-08-13T20:30:03Z"
+        ), mock.patch("provider._run") as run:
+            p._idle_tick()
+        run.assert_not_called()  # no docker stop on a foreign sidecar
+        self.assertTrue(p._foreign_sidecar)
+        # Subsequent ticks keep skipping silently (flag short-circuits).
+        with mock.patch.object(p, "_container_state", return_value="running"), mock.patch(
+            "provider._run"
+        ) as run2:
+            p._idle_tick()
+        run2.assert_not_called()
+
+    def test_tick_stops_container_started_by_this_instance(self):
+        # Same StartedAt as our last touch -> the sidecar is ours -> the
+        # idle-stop is legitimate.
+        p = FoxbridgeBrowserProvider(idle_timeout_s=60)
+        p._last_used = 0.0
+        p._owned_started_at = "2026-08-13T20:29:54Z"
+        with mock.patch.object(p, "_container_state", return_value="running"), mock.patch.object(
+            p, "_container_started_at", return_value="2026-08-13T20:29:54Z"
+        ), mock.patch("provider._run", return_value=(0, "")) as run:
+            p._idle_tick()
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:2], ["docker", "stop"])
+        self.assertEqual(cmd[2], p._container)
+
+    def test_touch_rebaselines_ownership(self):
+        # create_session restarts the sidecar first; _touch must adopt the
+        # fresh container (clearing the foreign flag) so the watcher can
+        # idle-stop it again.
+        p = FoxbridgeBrowserProvider()
+        p._foreign_sidecar = True
+        with mock.patch.object(
+            p, "_container_started_at", return_value="2026-08-13T20:29:54Z"
+        ), mock.patch("provider.threading.Thread"):
+            p._touch()
+        self.assertFalse(p._foreign_sidecar)
+        self.assertEqual(p._owned_started_at, "2026-08-13T20:29:54Z")
+
     def test_touch_starts_watcher_once(self):
         p = FoxbridgeBrowserProvider()
-        with mock.patch("provider.threading.Thread") as thread:
+        with mock.patch("provider.threading.Thread") as thread, mock.patch.object(
+            p, "_container_started_at", return_value=None
+        ):
             p._touch()
             p._touch()
         thread.assert_called_once()
